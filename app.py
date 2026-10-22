@@ -53,13 +53,13 @@ GEONEX_API_KEY = "ab5eddf53320d70f0cf0c908d6b69e9179e14296752eb226c699fcbd6fa887
 
 # ページの設定
 st.set_page_config(
-    page_title="山林査定・ハザード自動調査ミニツール",
+    page_title="ハザード自動判定ツール",
     page_icon="🌲",
     layout="centered",
 )
 
 
-st.title("🌲 不要山林 簡易ハザード自動査定ツール")
+st.title("🌲 ハザード自動判定ツール")
 st.write("住所と地番を入力して、一次スクリーニング（災害リスク判定）を行います。")
 
 
