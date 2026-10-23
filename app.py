@@ -1,14 +1,15 @@
+import base64
 import io
 import json
 import math
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
+import zlib
 
 import pydeck as pdk
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 USER_AGENT = "sanrin-hazard-mini-tool/1.0 (local streamlit demo)"
 GSI_URL = "https://msearch.gsi.go.jp/address-search/AddressSearch"
@@ -58,10 +59,6 @@ st.set_page_config(
     page_icon="🌲",
     layout="centered",
 )
-
-
-st.title("🌲 ハザード自動判定ツール")
-st.write("住所と地番を入力して、一次スクリーニング（災害リスク判定）を行います。")
 
 
 class GeocodeError(Exception):
@@ -420,7 +417,7 @@ def _render_location_map(features: list[dict]) -> None:
         mid_lat = float(features[0]["lat"])
         mid_lon = float(features[0]["lon"])
     else:
-        mid_lat, mid_lon, zoom = _view_for_points(lons, lats, 16 if len(features) == 1 else 13)
+        mid_lat, mid_lon, zoom = _view_for_points(lons, lats, 16 if len(features) == 1 else 5)
 
     layers = []
     if polygons:
@@ -949,13 +946,19 @@ def _missed_labels(records: list[dict]) -> list[str]:
     return labels
 
 
-def _share_message(items: list[dict], missed: list[str], include_judgment: bool = True) -> str:
+def _share_message(
+    items: list[dict],
+    missed: list[str],
+    include_judgment: bool = True,
+    map_url: str = "",
+) -> str:
     lines = [
         "山林の場所をお送りします。",
-        "写真の番号と、下のリンクの番号は同じです。",
-        "リンクを開くと、その土地にピンが落ちます。",
-        "",
+        "地図のリンクを開くと、航空写真を拡大・縮小して移動できます。番号は地図と同じです。",
     ]
+    if map_url:
+        lines.append(map_url)
+    lines.extend(["", "土地ごとのピンです。", ""])
     for item in items:
         lines.append(f"{item['number']}. {item['name']}")
         if include_judgment:
@@ -971,355 +974,7 @@ def _share_message(items: list[dict], missed: list[str], include_judgment: bool 
     return "\n".join(lines).strip()
 
 
-_JP_FONT = Path(__file__).resolve().parent / "fonts" / "NotoSansJP-Regular.ttf"
-_FONT_CACHE: dict[tuple[int, int], ImageFont.FreeTypeFont] = {}
-_SHARE_PHOTO_WIDTH = 1080
-_SHARE_MAP_HEIGHT = 680
-
-
-def _font(size: int, weight: int = 400) -> ImageFont.FreeTypeFont:
-    key = (size, weight)
-    cached = _FONT_CACHE.get(key)
-    if cached is not None:
-        return cached
-    font = ImageFont.truetype(_JP_FONT, size=size)
-    try:
-        font.set_variation_by_axes([weight])
-    except OSError:
-        pass
-    _FONT_CACHE[key] = font
-    return font
-
-
-def _hex_rgb(color: str) -> tuple[int, int, int]:
-    value = color.lstrip("#")
-    return tuple(int(value[index : index + 2], 16) for index in (0, 2, 4))
-
-
-def _risk_text_rgb(risk: str) -> tuple[int, int, int]:
-    if "安全" in risk:
-        return (30, 122, 58)
-    if "イエロー" in risk:
-        return (138, 98, 0)
-    if "危険" in risk or "レッド" in risk:
-        return (198, 40, 40)
-    return (49, 51, 63)
-
-
-def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    x = math.radians(lon2 - lon1) * math.cos(math.radians((lat1 + lat2) / 2))
-    y = math.radians(lat2 - lat1)
-    return 6371000 * math.hypot(x, y)
-
-
-def _world_px(lat: float, lon: float, zoom: int) -> tuple[float, float]:
-    scale = 256 * (2**zoom)
-    x = (lon + 180.0) / 360.0 * scale
-    lat_rad = math.radians(max(-85.0, min(85.0, lat)))
-    y = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * scale
-    return x, y
-
-
-def _item_points(item: dict) -> list[tuple[float, float]]:
-    ring = item.get("ring") or []
-    if len(ring) >= 3:
-        return [(float(lat), float(lon)) for lat, lon in ring]
-    return [(float(item["lat"]), float(item["lon"]))]
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
-def _aerial_tile(z: int, x: int, y: int) -> bytes:
-    """国土地理院の航空写真タイル。404 は空、通信エラーはキャッシュしない。"""
-    limit = 2**z
-    if not (0 <= x < limit and 0 <= y < limit):
-        return b""
-    url = f"https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg"
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            return response.read()
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return b""
-        raise
-
-
-def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: float) -> list[str]:
-    if not text:
-        return []
-    lines: list[str] = []
-    current = ""
-    for char in text:
-        trial = current + char
-        if current and font.getlength(trial) > max_width:
-            lines.append(current)
-            current = char
-        else:
-            current = trial
-    if current:
-        lines.append(current)
-    return lines
-
-
-def _badge_text_color(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
-    luminance = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
-    if luminance > 170:
-        return (31, 35, 40)
-    return (255, 255, 255)
-
-
-def _draw_badge(
-    draw: ImageDraw.ImageDraw,
-    x: float,
-    y: float,
-    label: str,
-    rgb: tuple[int, int, int],
-    font: ImageFont.FreeTypeFont,
-) -> None:
-    radius = 18 if len(label) < 2 else 20
-    draw.ellipse(
-        (x - radius, y - radius, x + radius, y + radius),
-        fill=rgb,
-        outline=(255, 255, 255),
-        width=3,
-    )
-    draw.text((x, y), label, font=font, fill=_badge_text_color(rgb), anchor="mm")
-
-
-def _cluster_items(items: list[dict], radius_m: float = 500) -> list[list[dict]]:
-    remaining = list(items)
-    groups: list[list[dict]] = []
-    while remaining:
-        group = [remaining.pop(0)]
-        changed = True
-        while changed:
-            changed = False
-            later = []
-            for item in remaining:
-                near = any(
-                    _distance_m(item["lat"], item["lon"], other["lat"], other["lon"]) <= radius_m
-                    for other in group
-                )
-                if near:
-                    group.append(item)
-                    changed = True
-                else:
-                    later.append(item)
-            remaining = later
-        groups.append(group)
-    return groups
-
-
-def _span_fits(items: list[dict], zoom: int, width: int, height: int, pad: int) -> bool:
-    xs = []
-    ys = []
-    for item in items:
-        for lat, lon in _item_points(item):
-            x, y = _world_px(lat, lon, zoom)
-            xs.append(x)
-            ys.append(y)
-    if not xs:
-        return True
-    return max(xs) - min(xs) <= width - pad * 2 and max(ys) - min(ys) <= height - pad * 2
-
-
-def _photo_groups(items: list[dict], width: int, height: int) -> list[list[dict]]:
-    groups = []
-    for group in _cluster_items(items):
-        if _span_fits(group, 16, width, height, 80):
-            groups.append(group)
-        else:
-            groups.extend([[item] for item in group])
-    return groups
-
-
-def _choose_zoom(items: list[dict], width: int, height: int) -> int:
-    for zoom in range(18, 14, -1):
-        if _span_fits(items, zoom, width, height, 80):
-            return zoom
-    return 15
-
-
-def _paste_tile(canvas: Image.Image, tile: Image.Image, dest_x: int, dest_y: int) -> None:
-    src_x = 0
-    src_y = 0
-    if dest_x < 0:
-        src_x = -dest_x
-        dest_x = 0
-    if dest_y < 0:
-        src_y = -dest_y
-        dest_y = 0
-    if dest_x >= canvas.width or dest_y >= canvas.height or src_x >= tile.width or src_y >= tile.height:
-        return
-    cropped = tile.crop(
-        (
-            src_x,
-            src_y,
-            min(tile.width, src_x + canvas.width - dest_x),
-            min(tile.height, src_y + canvas.height - dest_y),
-        )
-    )
-    if cropped.width <= 0 or cropped.height <= 0:
-        return
-    canvas.alpha_composite(cropped, (dest_x, dest_y))
-
-
-def _render_aerial(items: list[dict], zoom: int, width: int, height: int) -> Image.Image:
-    points = [point for item in items for point in _item_points(item)]
-    pixels = [_world_px(lat, lon, zoom) for lat, lon in points]
-    xs = [point[0] for point in pixels]
-    ys = [point[1] for point in pixels]
-    left = (min(xs) + max(xs)) / 2 - width / 2
-    top = (min(ys) + max(ys)) / 2 - height / 2
-    canvas = Image.new("RGBA", (width, height), (226, 230, 234, 255))
-    limit = 2**zoom
-    x0 = max(0, math.floor(left / 256))
-    y0 = max(0, math.floor(top / 256))
-    x1 = min(limit - 1, math.floor((left + width - 1) / 256))
-    y1 = min(limit - 1, math.floor((top + height - 1) / 256))
-    loaded = 0
-    for tile_x in range(x0, x1 + 1):
-        for tile_y in range(y0, y1 + 1):
-            try:
-                raw = _aerial_tile(zoom, tile_x, tile_y)
-            except (urllib.error.URLError, TimeoutError, OSError):
-                continue
-            if not raw:
-                continue
-            tile = Image.open(io.BytesIO(raw)).convert("RGBA")
-            _paste_tile(canvas, tile, round(tile_x * 256 - left), round(tile_y * 256 - top))
-            loaded += 1
-    if loaded == 0:
-        raise OSError("航空写真を取得できませんでした。")
-
-    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-
-    def to_px(lat: float, lon: float) -> tuple[float, float]:
-        x, y = _world_px(lat, lon, zoom)
-        return x - left, y - top
-
-    for item in items:
-        ring = item.get("ring") or []
-        if len(ring) < 3:
-            continue
-        polygon = [to_px(float(lat), float(lon)) for lat, lon in ring]
-        rgb = _hex_rgb(item["color"])
-        draw.polygon(polygon, fill=rgb + (130,))
-        draw.line(polygon + [polygon[0]], fill=(255, 255, 255, 235), width=4)
-    badge_font = _font(18, 700)
-    placed = []
-    for item in items:
-        x, y = to_px(float(item["lat"]), float(item["lon"]))
-        placed.append([item, x, y])
-    for _ in range(8):
-        for index, current in enumerate(placed):
-            for other in placed[:index]:
-                dx = current[1] - other[1]
-                dy = current[2] - other[2]
-                dist = math.hypot(dx, dy)
-                if dist >= 46:
-                    continue
-                if dist < 0.1:
-                    dx, dy, dist = 1.0, 0.0, 1.0
-                push = (46 - dist) / 2
-                current[1] += dx / dist * push
-                current[2] += dy / dist * push
-                other[1] -= dx / dist * push
-                other[2] -= dy / dist * push
-    for item, x, y in placed:
-        _draw_badge(draw, x, y, str(item["number"]), _hex_rgb(item["color"]), badge_font)
-    credit_font = _font(16, 500)
-    credit = "国土地理院"
-    box = credit_font.getbbox(credit)
-    text_w = box[2] - box[0]
-    text_h = box[3] - box[1]
-    pad = 6
-    credit_box = (10, height - 10 - text_h - pad * 2, 10 + text_w + pad * 2, height - 10)
-    draw.rounded_rectangle(credit_box, radius=6, fill=(0, 0, 0, 150))
-    draw.text((16, height - 10 - text_h - pad), credit, font=credit_font, fill=(255, 255, 255), anchor="lt")
-    return Image.alpha_composite(canvas, overlay)
-
-
-def _render_header(width: int, include_judgment: bool) -> Image.Image:
-    title_font = _font(30, 700)
-    body_font = _font(18, 400)
-    title = "ハザード自動判定ツール"
-    if include_judgment:
-        note = "番号の色が判定です。緑は区域外、黄は警戒区域、赤は特別警戒区域です。"
-    else:
-        note = "赤い線と番号が、土地の場所と筆の形です。"
-    note_lines = _wrap_text(note, body_font, width - 48)
-    height = 24 + 40 + 8 + 28 * len(note_lines) + 16
-    image = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(image)
-    draw.text((24, 20), title, font=title_font, fill=(31, 35, 40))
-    y = 68
-    for line in note_lines:
-        draw.text((24, y), line, font=body_font, fill=(68, 68, 68))
-        y += 28
-    return image
-
-
-def _render_caption(items: list[dict], width: int) -> Image.Image:
-    name_font = _font(24, 500)
-    risk_font = _font(22, 700)
-    note_font = _font(18, 400)
-    text_width = width - 88
-    prepared = []
-    for item in items:
-        name_lines = _wrap_text(item["name"], name_font, text_width) or [""]
-        detail = "　".join(part for part in (item["risk"], item["area"]) if part)
-        detail_lines = _wrap_text(detail, risk_font, text_width) if detail else []
-        note_lines = _wrap_text(item.get("note") or "", note_font, text_width)
-        row_h = 8 + len(name_lines) * 32 + len(detail_lines) * 30 + len(note_lines) * 26 + 10
-        prepared.append((item, name_lines, detail_lines, note_lines, max(row_h, 56)))
-    height = 12 + sum(row[4] for row in prepared) + 8
-    image = Image.new("RGB", (width, height), (244, 246, 248))
-    draw = ImageDraw.Draw(image)
-    y = 12
-    badge_font = _font(16, 700)
-    for index, (item, name_lines, detail_lines, note_lines, row_h) in enumerate(prepared):
-        if index:
-            draw.line((24, y, width - 24, y), fill=(220, 224, 228), width=1)
-            y += 1
-        _draw_badge(draw, 42, y + 24, str(item["number"]), _hex_rgb(item["color"]), badge_font)
-        text_y = y + 6
-        for line in name_lines:
-            draw.text((72, text_y), line, font=name_font, fill=(31, 35, 40))
-            text_y += 32
-        risk_color = _risk_text_rgb(item["risk"])
-        for line in detail_lines:
-            draw.text((72, text_y), line, font=risk_font, fill=risk_color)
-            text_y += 30
-        for line in note_lines:
-            draw.text((72, text_y), line, font=note_font, fill=(138, 90, 0))
-            text_y += 26
-        y += row_h
-    return image
-
-
-def _render_footer(width: int, include_judgment: bool) -> Image.Image:
-    font = _font(16, 400)
-    if include_judgment:
-        text = (
-            "航空写真: 国土地理院。色分けはハザードマップポータルの参考図で、"
-            "県の公示図の代わりにはなりません。"
-        )
-    else:
-        text = "航空写真: 国土地理院。赤い線は筆の形で、判定結果は入っていません。"
-    lines = _wrap_text(text, font, width - 48)
-    height = 16 + 24 * len(lines) + 16
-    image = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(image)
-    y = 14
-    for line in lines:
-        draw.text((24, y), line, font=font, fill=(102, 102, 102))
-        y += 24
-    return image
-
-
-def _photo_items(items: list[dict], include_judgment: bool) -> list[dict]:
+def _display_items(items: list[dict], include_judgment: bool) -> list[dict]:
     if include_judgment:
         return items
     shown = []
@@ -1332,26 +987,232 @@ def _photo_items(items: list[dict], include_judgment: bool) -> list[dict]:
     return shown
 
 
-def _share_photo(items: list[dict], include_judgment: bool = True) -> bytes:
-    """航空写真を、開いて送れる JPEG にする。"""
-    shown = _photo_items(items, include_judgment)
-    width = _SHARE_PHOTO_WIDTH
-    map_height = _SHARE_MAP_HEIGHT if len(shown) <= 4 else 560
-    pieces = [_render_header(width, include_judgment)]
-    for group in _photo_groups(shown, width, map_height):
-        zoom = _choose_zoom(group, width, map_height)
-        pieces.append(_render_aerial(group, zoom, width, map_height))
-        pieces.append(_render_caption(group, width))
-    pieces.append(_render_footer(width, include_judgment))
-    height = sum(piece.height for piece in pieces)
-    image = Image.new("RGB", (width, height), "white")
-    y = 0
-    for piece in pieces:
-        image.paste(piece.convert("RGB"), (0, y))
-        y += piece.height
-    buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=90, subsampling=0, optimize=True)
-    return buffer.getvalue()
+def _hex_rgb(color: str) -> tuple[int, int, int]:
+    value = color.lstrip("#")
+    return tuple(int(value[index : index + 2], 16) for index in (0, 2, 4))
+
+
+def _encode_places(items: list[dict], include_judgment: bool) -> str:
+    shown = _display_items(items, include_judgment)
+    payload = {
+        "j": 1 if include_judgment else 0,
+        "p": [
+            {
+                "n": item["number"],
+                "a": item["name"],
+                "r": item["risk"],
+                "s": item["area"],
+                "e": item["note"],
+                "y": round(float(item["lat"]), 6),
+                "x": round(float(item["lon"]), 6),
+                "g": [[round(float(lat), 6), round(float(lon), 6)] for lat, lon in item.get("ring") or []],
+                "c": item["color"],
+            }
+            for item in shown
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    token = base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode()
+    return token.rstrip("=")
+
+
+def _decode_places(token: str) -> tuple[list[dict], bool]:
+    if len(token) > 50_000:
+        raise ValueError("places")
+    padded = token + "=" * (-len(token) % 4)
+    decoder = zlib.decompressobj()
+    raw = decoder.decompress(base64.urlsafe_b64decode(padded.encode()), 200_000)
+    rest = decoder.flush()
+    if decoder.unconsumed_tail or len(raw) + len(rest) > 200_000:
+        raise ValueError("places")
+    payload = json.loads(raw + rest)
+    if not isinstance(payload, dict) or not isinstance(payload.get("p"), list):
+        raise ValueError("places")
+    items = []
+    for entry in payload["p"][:30]:
+        if not isinstance(entry, dict):
+            continue
+        lat = float(entry["y"])
+        lon = float(entry["x"])
+        ring = entry.get("g") or []
+        items.append(
+            {
+                "number": int(entry["n"]),
+                "name": str(entry.get("a") or ""),
+                "risk": str(entry.get("r") or ""),
+                "area": str(entry.get("s") or ""),
+                "note": str(entry.get("e") or ""),
+                "lat": lat,
+                "lon": lon,
+                "ring": ring,
+                "color": str(entry.get("c") or "#d63028"),
+                "maps_url": _google_maps_url(lat, lon),
+            }
+        )
+    if not items:
+        raise ValueError("places")
+    return items, bool(payload.get("j"))
+
+
+def _app_base_url() -> str:
+    current = ""
+    try:
+        current = str(st.context.url or "")
+    except AttributeError:
+        current = ""
+    parsed = urllib.parse.urlparse(current) if current else None
+    if parsed and parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    return "https://domechin6248-sanrin-tool-app-brsaqj.streamlit.app/"
+
+
+def _share_page_url(token: str) -> str:
+    return f"{_app_base_url()}?{urllib.parse.urlencode({'places': token})}"
+
+
+def _render_share_map(items: list[dict], state_key: str) -> None:
+    """すべての筆を一つの航空写真に載せ、拡大・縮小と移動ができるようにする。"""
+    choice = "全体を表示"
+    labels = [f"{item['number']}. {item['name']}" for item in items]
+    if len(items) > 1:
+        choice = st.selectbox(
+            "見る場所",
+            ["全体を表示"] + labels,
+            key=f"{state_key}_choice",
+        )
+    lons: list[float] = []
+    lats: list[float] = []
+    polygons = []
+    points = []
+    labels = []
+    for item in items:
+        lat = float(item["lat"])
+        lon = float(item["lon"])
+        rgb = _hex_rgb(item["color"])
+        fill = [rgb[0], rgb[1], rgb[2], 150]
+        label = f"{item['number']}. {item['name']}"
+        detail = " / ".join(part for part in (item.get("risk") or "", item.get("area") or "") if part)
+        if detail:
+            label = f"{label}　{detail}"
+        if item.get("note"):
+            label = f"{label}　{item['note']}"
+        lons.append(lon)
+        lats.append(lat)
+        ring = item.get("ring") or []
+        if len(ring) >= 3:
+            polygon = [[float(point[1]), float(point[0])] for point in ring]
+            if polygon[0] != polygon[-1]:
+                polygon.append(polygon[0])
+            for point in polygon:
+                lons.append(float(point[0]))
+                lats.append(float(point[1]))
+            polygons.append({"polygon": [polygon], "fill": fill, "line": [255, 255, 255, 255], "label": label})
+        points.append(
+            {
+                "position": [lon, lat],
+                "fill": [rgb[0], rgb[1], rgb[2], 255],
+                "label": label,
+            }
+        )
+        labels.append({"position": [lon, lat], "text": str(item["number"]), "label": label})
+
+    if choice == "全体を表示":
+        mid_lat, mid_lon, zoom = _view_for_points(lons, lats, 4)
+    else:
+        selected = items[labels.index(choice)]
+        mid_lat = float(selected["lat"])
+        mid_lon = float(selected["lon"])
+        zoom = 18
+
+    layers = []
+    if polygons:
+        layers.append(
+            pdk.Layer(
+                "PolygonLayer",
+                polygons,
+                get_polygon="polygon",
+                get_fill_color="fill",
+                get_line_color="line",
+                stroked=True,
+                filled=True,
+                line_width_min_pixels=2,
+                pickable=True,
+            )
+        )
+    layers.append(
+        pdk.Layer(
+            "ScatterplotLayer",
+            points,
+            get_position="position",
+            get_fill_color="fill",
+            get_line_color=[255, 255, 255, 255],
+            get_radius=2,
+            radius_min_pixels=10,
+            stroked=True,
+            line_width_min_pixels=2,
+            pickable=True,
+        )
+    )
+    layers.append(
+        pdk.Layer(
+            "TextLayer",
+            labels,
+            get_position="position",
+            get_text="text",
+            get_size=16,
+            get_color=[255, 255, 255, 255],
+            get_alignment_baseline="'center'",
+            get_text_anchor="'middle'",
+            billboard=True,
+            size_min_pixels=14,
+            pickable=False,
+        )
+    )
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=pdk.ViewState(
+            latitude=mid_lat,
+            longitude=mid_lon,
+            zoom=zoom,
+            min_zoom=4,
+            max_zoom=18,
+        ),
+        map_style=_AERIAL_MAP_STYLE_URL,
+        map_provider="maplibre",
+        tooltip={"text": "{label}"},
+    )
+    st.pydeck_chart(deck, height=560, key=f"{state_key}_{choice}")
+    st.caption("ドラッグで移動、スクロールやピンチで拡大・縮小できます。航空写真: 国土地理院")
+
+
+def _show_shared_places(items: list[dict], include_judgment: bool) -> None:
+    st.title("🌲 ハザード自動判定ツール")
+    st.subheader("航空写真")
+    if include_judgment:
+        st.caption("番号の色が判定です。緑は区域外、黄は警戒区域、赤は特別警戒区域です。")
+    else:
+        st.caption("赤い線と番号が、土地の場所と筆の形です。")
+    _render_share_map(items, "shared_place")
+    for item in items:
+        detail = " / ".join(part for part in (item.get("risk") or "", item.get("area") or "") if part)
+        st.markdown(f"**{item['number']}. {item['name']}**")
+        if detail:
+            st.write(detail)
+        if item.get("note"):
+            st.caption(item["note"])
+        st.link_button("この土地を地図アプリで開く", item["maps_url"])
+    st.link_button("新しく調べる", _app_base_url())
+
+
+def _shared_places_from_query() -> tuple[list[dict], bool] | None:
+    token = str(st.query_params.get("places", "") or "")
+    if not token:
+        return None
+    try:
+        return _decode_places(token)
+    except (ValueError, OSError, json.JSONDecodeError, zlib.error):
+        st.error("地図のリンクを読み取れませんでした。")
+        st.stop()
 
 
 def _show_share(records: list[dict]) -> None:
@@ -1368,29 +1229,12 @@ def _show_share(records: list[dict]) -> None:
         st.caption("番号の色が判定です。外すと、場所と筆の形だけを赤で表示します。")
     else:
         st.caption("場所と筆の形だけを、赤で表示しています。")
-    st.caption("番号は、文面と航空写真で同じです。文面は右上からコピーして、写真と一緒に送れます。")
-    st.code(_share_message(items, _missed_labels(records), include_judgment), language=None)
-    try:
-        with st.spinner("航空写真を作っています…"):
-            photo = _share_photo(items, include_judgment)
-    except (OSError, TimeoutError, urllib.error.URLError):
-        st.error("航空写真を作れませんでした。上の文面のリンクから場所を開けます。")
-        return
-    st.image(photo, width="stretch")
-    if include_judgment:
-        download_label = "判定つき航空写真をダウンロード"
-        download_name = "判定つき航空写真.jpg"
-    else:
-        download_label = "場所の航空写真をダウンロード"
-        download_name = "場所の航空写真.jpg"
-    st.download_button(
-        download_label,
-        data=photo,
-        file_name=download_name,
-        mime="image/jpeg",
-        key="share_photo_download",
-    )
-    st.caption("ダウンロードしたファイルは写真です。スマートフォンで開いて、LINEやメールに添付できます。")
+    st.caption("筆が離れていても写真は一つです。拡大・縮小と移動で、それぞれの場所を見られます。")
+    shown = _display_items(items, include_judgment)
+    _render_share_map(shown, "share_place")
+    map_url = _share_page_url(_encode_places(items, include_judgment))
+    st.code(_share_message(items, _missed_labels(records), include_judgment, map_url), language=None)
+    st.caption("上の文面をコピーして送ると、受け取った人も同じ航空写真を開けます。")
 
 
 
@@ -1406,6 +1250,16 @@ def _map_feature(label_prefix: str, location: dict, hazard: dict | None) -> dict
         "label": label,
     }
 
+
+
+_shared_places = _shared_places_from_query()
+if _shared_places is not None:
+    _shared_items, _shared_judgment = _shared_places
+    _show_shared_places(_shared_items, _shared_judgment)
+    st.stop()
+
+st.title("🌲 ハザード自動判定ツール")
+st.write("住所と地番を入力して、一次スクリーニング（災害リスク判定）を行います。")
 
 # --- 入力フォーム ---
 st.subheader("📍 査定物件の入力")
