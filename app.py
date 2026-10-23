@@ -991,11 +991,10 @@ def _share_message(
 ) -> str:
     lines = [
         "山林の場所をお送りします。",
-        "地図のリンクを開くと、航空写真を拡大・縮小して移動できます。番号は地図と同じです。",
+        "リンクは一つです。開くと、調べた土地がすべて一つの地図に表示されます。ピンの数は筆の数です。",
     ]
     if map_url:
-        lines.append(map_url)
-    lines.extend(["", "土地ごとのピンです。", ""])
+        lines.extend(["", map_url, ""])
     for item in items:
         lines.append(f"{item['number']}. {item['name']}")
         if include_judgment:
@@ -1004,7 +1003,6 @@ def _share_message(
                 lines.append(detail)
         if item["note"]:
             lines.append(item["note"])
-        lines.append(item["maps_url"])
         lines.append("")
     if missed:
         lines.append("場所を特定できなかった筆: " + "、".join(missed))
@@ -1151,7 +1149,7 @@ def _render_share_map(items: list[dict], state_key: str) -> None:
         points.append(
             {
                 "position": [lon, lat],
-                "fill": [rgb[0], rgb[1], rgb[2], 255],
+                "fill": [rgb[0], rgb[1], rgb[2], 235],
                 "label": label,
             }
         )
@@ -1189,10 +1187,10 @@ def _render_share_map(items: list[dict], state_key: str) -> None:
             get_position="position",
             get_fill_color="fill",
             get_line_color=[255, 255, 255, 255],
-            get_radius=2,
-            radius_min_pixels=10,
+            get_radius=8,
+            radius_min_pixels=18,
             stroked=True,
-            line_width_min_pixels=2,
+            line_width_min_pixels=3,
             pickable=True,
         )
     )
@@ -1230,11 +1228,11 @@ def _render_share_map(items: list[dict], state_key: str) -> None:
 
 def _show_shared_places(items: list[dict], include_judgment: bool) -> None:
     st.title("🌲 ハザード自動判定ツール")
-    st.subheader("航空写真")
+    st.subheader("調べた土地")
     if include_judgment:
-        st.caption("番号の色が判定です。緑は区域外、黄は警戒区域、赤は特別警戒区域です。")
+        st.caption("ピンの数は筆の数です。色は判定です。緑は区域外、黄は警戒区域、赤は特別警戒区域です。")
     else:
-        st.caption("赤い線と番号が、土地の場所と筆の形です。")
+        st.caption("ピンの数は筆の数です。赤いピンが、土地の場所です。")
     _render_share_map(items, "shared_place")
     for item in items:
         detail = " / ".join(part for part in (item.get("risk") or "", item.get("area") or "") if part)
@@ -1243,7 +1241,6 @@ def _show_shared_places(items: list[dict], include_judgment: bool) -> None:
             st.write(detail)
         if item.get("note"):
             st.caption(item["note"])
-        st.link_button("この土地を地図アプリで開く", item["maps_url"])
     st.link_button("新しく調べる", _app_base_url())
 
 
@@ -1269,15 +1266,16 @@ def _show_share(records: list[dict]) -> None:
         key="share_include_judgment",
     )
     if include_judgment:
-        st.caption("番号の色が判定です。外すと、場所と筆の形だけを赤で表示します。")
+        st.caption("ピンの色が判定です。外すと、場所と筆の形だけを赤いピンで表示します。")
     else:
-        st.caption("場所と筆の形だけを、赤で表示しています。")
-    st.caption("筆が離れていても写真は一つです。拡大・縮小と移動で、それぞれの場所を見られます。")
+        st.caption("場所と筆の形だけを、赤いピンで表示しています。")
+    st.caption("リンクは一つです。複数の筆があっても、同じ地図にピンが並びます。")
     shown = _display_items(items, include_judgment)
     _render_share_map(shown, "share_place")
     map_url = _share_page_url(_encode_places(items, include_judgment))
+    st.link_button("この地図を開いて確認", map_url)
     st.code(_share_message(items, _missed_labels(records), include_judgment, map_url), language=None)
-    st.caption("上の文面をコピーして送ると、受け取った人も同じ航空写真を開けます。")
+    st.caption("上の文面をコピーして送ると、受け取った人も同じ地図を開けます。")
 
 
 
