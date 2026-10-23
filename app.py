@@ -153,6 +153,43 @@ def _address_towns(city_code: str) -> list[str]:
     return names
 
 
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def _area_readings() -> dict:
+    """都道府県と市区町村の読み。市区町村名は登記所データの表記に合わせる。"""
+    request = urllib.request.Request(
+        f"{GEOLONIA_TOWN_URL}.json",
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeError):
+        return {"prefectures": {}, "cities": {}}
+    prefectures = {}
+    cities: dict[str, dict[str, str]] = {}
+    for row in payload.get("data") or []:
+        prefecture_name = (row.get("pref") or "").strip()
+        prefecture_kana = (row.get("pref_k") or "").strip()
+        if prefecture_name and prefecture_kana:
+            prefectures[prefecture_name] = prefecture_kana
+        city_readings = {}
+        for city in row.get("cities") or []:
+            name = (city.get("city") or "").strip()
+            reading = (city.get("city_k") or "").strip()
+            ward = (city.get("ward") or "").strip()
+            county = (city.get("county") or "").strip()
+            if ward:
+                name = f"{name}{ward}"
+                reading = f"{reading}{(city.get('ward_k') or '').strip()}"
+            elif county:
+                name = f"{county}{name}"
+            if name and reading and name not in city_readings:
+                city_readings[name] = reading
+        if prefecture_name:
+            cities[prefecture_name] = city_readings
+    return {"prefectures": prefectures, "cities": cities}
+
+
 def _choice_index(options: list[str], preferred: str) -> int:
     if preferred in options:
         return options.index(preferred)
@@ -1277,12 +1314,34 @@ if address_mode == "リストから選ぶ":
     if not prefectures:
         st.error("都道府県の一覧を取得できませんでした。自由入力に切り替えてください。")
     else:
+        area_readings = _area_readings()
         prefecture_names = [item["name"] for item in prefectures]
+        prefecture_readings = area_readings["prefectures"]
+        prefecture_grouped = _group_towns(prefecture_names, prefecture_readings)
+        preferred_prefecture = "鹿児島県"
+        preferred_prefecture_row = next(
+            (row for row, names in prefecture_grouped.items() if preferred_prefecture in names),
+            next(iter(prefecture_grouped)),
+        )
+        prefecture_row = st.pills(
+            "頭文字",
+            list(prefecture_grouped),
+            default=preferred_prefecture_row,
+            required=True,
+            key="address_pref_kana",
+        )
+        if prefecture_row not in prefecture_grouped:
+            prefecture_row = preferred_prefecture_row
+        visible_prefectures = prefecture_grouped[prefecture_row]
         prefecture_name = st.selectbox(
             "都道府県",
-            prefecture_names,
-            index=_choice_index(prefecture_names, "鹿児島県"),
-            key="address_prefecture",
+            visible_prefectures,
+            index=_choice_index(
+                visible_prefectures,
+                preferred_prefecture if preferred_prefecture in visible_prefectures else visible_prefectures[0],
+            ),
+            format_func=lambda name: _town_label(name, prefecture_readings),
+            key=f"address_prefecture_{prefecture_row}",
         )
         prefecture_code = next(
             item["code"] for item in prefectures if item["name"] == prefecture_name
@@ -1292,12 +1351,32 @@ if address_mode == "リストから選ぶ":
             st.error("市区町村の一覧を取得できませんでした。")
         else:
             city_names = [item["name"] for item in cities]
+            city_readings = area_readings["cities"].get(prefecture_name, {})
+            city_grouped = _group_towns(city_names, city_readings)
             preferred_city = "薩摩川内市" if prefecture_name == "鹿児島県" else city_names[0]
+            preferred_city_row = next(
+                (row for row, names in city_grouped.items() if preferred_city in names),
+                next(iter(city_grouped)),
+            )
+            city_row = st.pills(
+                "頭文字",
+                list(city_grouped),
+                default=preferred_city_row,
+                required=True,
+                key=f"address_city_kana_{prefecture_code}",
+            )
+            if city_row not in city_grouped:
+                city_row = preferred_city_row
+            visible_cities = city_grouped[city_row]
             city_name = st.selectbox(
                 "市区町村",
-                city_names,
-                index=_choice_index(city_names, preferred_city),
-                key=f"address_city_{prefecture_code}",
+                visible_cities,
+                index=_choice_index(
+                    visible_cities,
+                    preferred_city if preferred_city in visible_cities else visible_cities[0],
+                ),
+                format_func=lambda name: _town_label(name, city_readings),
+                key=f"address_city_{prefecture_code}_{city_row}",
             )
             city_code = next(item["code"] for item in cities if item["name"] == city_name)
             town_names = _address_towns(city_code)
