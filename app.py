@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import math
+import struct
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1027,36 +1028,142 @@ def _hex_rgb(color: str) -> tuple[int, int, int]:
     return tuple(int(value[index : index + 2], 16) for index in (0, 2, 4))
 
 
+_RISK_CODE = {"安全（区域外）": 1, "要警戒（イエロー）": 2, "危険（レッド）": 3}
+_CODE_RISK = {1: "安全（区域外）", 2: "要警戒（イエロー）", 3: "危険（レッド）"}
+_CODE_COLOR = {0: "#d63028", 1: "#2ea854", 2: "#f0b400", 3: "#d63028"}
+_NOTE_TEXT = {
+    1: "指定の地番そのものではなく、近い筆の位置です。",
+    2: "地番の筆は見つからず、町名の代表点です。",
+}
+
+
+def _common_prefix(texts: list[str]) -> str:
+    if not texts:
+        return ""
+    prefix = texts[0]
+    for text in texts[1:]:
+        while prefix and not text.startswith(prefix):
+            prefix = prefix[:-1]
+    return prefix
+
+
+def _note_code(note: str) -> int:
+    if "近い" in note:
+        return 1
+    if "町名" in note:
+        return 2
+    return 0
+
+
+def _area_tenths(area: str) -> int:
+    text = area.replace("㎡", "").replace(",", "").strip()
+    if not text:
+        return 0
+    try:
+        return max(0, min(int(round(float(text) * 10)), 0xFFFFFFFF))
+    except ValueError:
+        return 0
+
+
+def _format_area(tenths: int) -> str:
+    if tenths <= 0:
+        return ""
+    return f"{tenths / 10:,.1f}㎡"
+
+
 def _encode_places(items: list[dict], include_judgment: bool) -> str:
+    """地図に必要な情報だけを詰め、共有リンクを短くする。"""
     shown = _display_items(items, include_judgment)
-    payload = {
-        "j": 1 if include_judgment else 0,
-        "p": [
-            {
-                "n": item["number"],
-                "a": item["name"],
-                "r": item["risk"],
-                "s": item["area"],
-                "e": item["note"],
-                "y": round(float(item["lat"]), 6),
-                "x": round(float(item["lon"]), 6),
-                "g": [[round(float(lat), 6), round(float(lon), 6)] for lat, lon in item.get("ring") or []],
-                "c": item["color"],
-            }
-            for item in shown
-        ],
-    }
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
-    token = base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode()
-    return token.rstrip("=")
+    prefix = _common_prefix([item["name"] for item in shown])
+    prefix_bytes = prefix.encode()
+    body = bytearray(struct.pack("<BBH", 2, 1 if include_judgment else 0, len(prefix_bytes)))
+    body += prefix_bytes
+    body += struct.pack("<B", len(shown))
+    for item in shown:
+        suffix = item["name"][len(prefix) :].encode()[:65535]
+        lat_micro = int(round(float(item["lat"]) * 1_000_000))
+        lon_micro = int(round(float(item["lon"]) * 1_000_000))
+        ring: list[tuple[int, int]] = []
+        for point in item.get("ring") or []:
+            if len(point) < 2:
+                continue
+            dy = int(round(float(point[0]) * 1_000_000)) - lat_micro
+            dx = int(round(float(point[1]) * 1_000_000)) - lon_micro
+            if not -32768 <= dy <= 32767 or not -32768 <= dx <= 32767:
+                ring = []
+                break
+            ring.append((dy, dx))
+        if len(ring) < 3 or len(ring) > 255:
+            ring = []
+        body += struct.pack(
+            "<BiiBBIH",
+            int(item["number"]) & 255,
+            lat_micro,
+            lon_micro,
+            _RISK_CODE.get(item.get("risk") or "", 0),
+            _note_code(item.get("note") or ""),
+            _area_tenths(item.get("area") or "") if include_judgment else 0,
+            len(suffix),
+        )
+        body += suffix
+        body += struct.pack("<B", len(ring))
+        for dy, dx in ring:
+            body += struct.pack("<hh", dy, dx)
+    return base64.urlsafe_b64encode(bytes(body)).decode().rstrip("=")
 
 
-def _decode_places(token: str) -> tuple[list[dict], bool]:
-    if len(token) > 50_000:
+def _unpack_from(data: bytes, offset: int, fmt: str) -> tuple[tuple, int]:
+    size = struct.calcsize(fmt)
+    if offset + size > len(data):
         raise ValueError("places")
-    padded = token + "=" * (-len(token) % 4)
+    return struct.unpack_from(fmt, data, offset), offset + size
+
+
+def _decode_compact_places(data: bytes) -> tuple[list[dict], bool]:
+    values, offset = _unpack_from(data, 0, "<BBH")
+    _version, flags, prefix_len = values
+    if offset + prefix_len > len(data):
+        raise ValueError("places")
+    prefix = data[offset : offset + prefix_len].decode()
+    offset += prefix_len
+    (count,), offset = _unpack_from(data, offset, "<B")
+    items = []
+    for _ in range(min(count, 30)):
+        values, offset = _unpack_from(data, offset, "<BiiBBIH")
+        number, lat_micro, lon_micro, risk_code, note_code, area_tenths, suffix_len = values
+        if offset + suffix_len > len(data):
+            raise ValueError("places")
+        name = prefix + data[offset : offset + suffix_len].decode()
+        offset += suffix_len
+        (ring_count,), offset = _unpack_from(data, offset, "<B")
+        ring = []
+        for _point in range(ring_count):
+            (dy, dx), offset = _unpack_from(data, offset, "<hh")
+            ring.append([(lat_micro + dy) / 1_000_000, (lon_micro + dx) / 1_000_000])
+        lat = lat_micro / 1_000_000
+        lon = lon_micro / 1_000_000
+        items.append(
+            {
+                "number": int(number),
+                "name": name,
+                "risk": _CODE_RISK.get(risk_code, ""),
+                "area": _format_area(area_tenths),
+                "note": _NOTE_TEXT.get(note_code, ""),
+                "lat": lat,
+                "lon": lon,
+                "ring": ring,
+                "color": _CODE_COLOR.get(risk_code, "#d63028"),
+                "maps_url": _google_maps_url(lat, lon),
+            }
+        )
+    if not items:
+        raise ValueError("places")
+    return items, bool(flags & 1)
+
+
+def _decode_legacy_places(data: bytes) -> tuple[list[dict], bool]:
     decoder = zlib.decompressobj()
-    raw = decoder.decompress(base64.urlsafe_b64decode(padded.encode()), 200_000)
+    raw = decoder.decompress(data, 200_000)
     rest = decoder.flush()
     if decoder.unconsumed_tail or len(raw) + len(rest) > 200_000:
         raise ValueError("places")
@@ -1069,7 +1176,6 @@ def _decode_places(token: str) -> tuple[list[dict], bool]:
             continue
         lat = float(entry["y"])
         lon = float(entry["x"])
-        ring = entry.get("g") or []
         items.append(
             {
                 "number": int(entry["n"]),
@@ -1079,7 +1185,7 @@ def _decode_places(token: str) -> tuple[list[dict], bool]:
                 "note": str(entry.get("e") or ""),
                 "lat": lat,
                 "lon": lon,
-                "ring": ring,
+                "ring": entry.get("g") or [],
                 "color": str(entry.get("c") or "#d63028"),
                 "maps_url": _google_maps_url(lat, lon),
             }
@@ -1087,6 +1193,19 @@ def _decode_places(token: str) -> tuple[list[dict], bool]:
     if not items:
         raise ValueError("places")
     return items, bool(payload.get("j"))
+
+
+def _decode_places(token: str) -> tuple[list[dict], bool]:
+    if len(token) > 50_000:
+        raise ValueError("places")
+    padded = token + "=" * (-len(token) % 4)
+    try:
+        data = base64.urlsafe_b64decode(padded.encode())
+    except (ValueError, TypeError):
+        raise ValueError("places") from None
+    if data[:1] == b"\x02":
+        return _decode_compact_places(data)
+    return _decode_legacy_places(data)
 
 
 def _app_base_url() -> str:
@@ -1102,7 +1221,7 @@ def _app_base_url() -> str:
 
 
 def _share_page_url(token: str) -> str:
-    return f"{_app_base_url()}?{urllib.parse.urlencode({'places': token})}"
+    return f"{_app_base_url()}?p={token}"
 
 
 def _render_share_map(items: list[dict], state_key: str) -> None:
@@ -1245,7 +1364,7 @@ def _show_shared_places(items: list[dict], include_judgment: bool) -> None:
 
 
 def _shared_places_from_query() -> tuple[list[dict], bool] | None:
-    token = str(st.query_params.get("places", "") or "")
+    token = str(st.query_params.get("p", "") or st.query_params.get("places", "") or "")
     if not token:
         return None
     try:
