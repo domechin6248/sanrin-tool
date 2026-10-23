@@ -949,7 +949,7 @@ def _missed_labels(records: list[dict]) -> list[str]:
     return labels
 
 
-def _share_message(items: list[dict], missed: list[str]) -> str:
+def _share_message(items: list[dict], missed: list[str], include_judgment: bool = True) -> str:
     lines = [
         "山林の場所をお送りします。",
         "写真の番号と、下のリンクの番号は同じです。",
@@ -958,9 +958,10 @@ def _share_message(items: list[dict], missed: list[str]) -> str:
     ]
     for item in items:
         lines.append(f"{item['number']}. {item['name']}")
-        detail = " / ".join(part for part in (item["risk"], item["area"]) if part)
-        if detail:
-            lines.append(detail)
+        if include_judgment:
+            detail = " / ".join(part for part in (item["risk"], item["area"]) if part)
+            if detail:
+                lines.append(detail)
         if item["note"]:
             lines.append(item["note"])
         lines.append(item["maps_url"])
@@ -1240,11 +1241,14 @@ def _render_aerial(items: list[dict], zoom: int, width: int, height: int) -> Ima
     return Image.alpha_composite(canvas, overlay)
 
 
-def _render_header(width: int) -> Image.Image:
+def _render_header(width: int, include_judgment: bool) -> Image.Image:
     title_font = _font(30, 700)
     body_font = _font(18, 400)
     title = "ハザード自動判定ツール"
-    note = "番号の色が判定です。緑は区域外、黄は警戒区域、赤は特別警戒区域です。"
+    if include_judgment:
+        note = "番号の色が判定です。緑は区域外、黄は警戒区域、赤は特別警戒区域です。"
+    else:
+        note = "赤い線と番号が、土地の場所と筆の形です。"
     note_lines = _wrap_text(note, body_font, width - 48)
     height = 24 + 40 + 8 + 28 * len(note_lines) + 16
     image = Image.new("RGB", (width, height), "white")
@@ -1295,12 +1299,15 @@ def _render_caption(items: list[dict], width: int) -> Image.Image:
     return image
 
 
-def _render_footer(width: int) -> Image.Image:
+def _render_footer(width: int, include_judgment: bool) -> Image.Image:
     font = _font(16, 400)
-    text = (
-        "航空写真: 国土地理院。色分けはハザードマップポータルの参考図で、"
-        "県の公示図の代わりにはなりません。"
-    )
+    if include_judgment:
+        text = (
+            "航空写真: 国土地理院。色分けはハザードマップポータルの参考図で、"
+            "県の公示図の代わりにはなりません。"
+        )
+    else:
+        text = "航空写真: 国土地理院。赤い線は筆の形で、判定結果は入っていません。"
     lines = _wrap_text(text, font, width - 48)
     height = 16 + 24 * len(lines) + 16
     image = Image.new("RGB", (width, height), "white")
@@ -1312,16 +1319,30 @@ def _render_footer(width: int) -> Image.Image:
     return image
 
 
-def _share_photo(items: list[dict]) -> bytes:
-    """判定を書き込んだ航空写真を、開いて送れる JPEG にする。"""
+def _photo_items(items: list[dict], include_judgment: bool) -> list[dict]:
+    if include_judgment:
+        return items
+    shown = []
+    for item in items:
+        copy = dict(item)
+        copy["color"] = "#d63028"
+        copy["risk"] = ""
+        copy["area"] = ""
+        shown.append(copy)
+    return shown
+
+
+def _share_photo(items: list[dict], include_judgment: bool = True) -> bytes:
+    """航空写真を、開いて送れる JPEG にする。"""
+    shown = _photo_items(items, include_judgment)
     width = _SHARE_PHOTO_WIDTH
-    map_height = _SHARE_MAP_HEIGHT if len(items) <= 4 else 560
-    pieces = [_render_header(width)]
-    for group in _photo_groups(items, width, map_height):
+    map_height = _SHARE_MAP_HEIGHT if len(shown) <= 4 else 560
+    pieces = [_render_header(width, include_judgment)]
+    for group in _photo_groups(shown, width, map_height):
         zoom = _choose_zoom(group, width, map_height)
         pieces.append(_render_aerial(group, zoom, width, map_height))
         pieces.append(_render_caption(group, width))
-    pieces.append(_render_footer(width))
+    pieces.append(_render_footer(width, include_judgment))
     height = sum(piece.height for piece in pieces)
     image = Image.new("RGB", (width, height), "white")
     y = 0
@@ -1338,19 +1359,34 @@ def _show_share(records: list[dict]) -> None:
     if not items:
         return
     st.subheader("📤 引き取り手へ場所を共有")
+    include_judgment = st.checkbox(
+        "判定結果を入れる",
+        value=True,
+        key="share_include_judgment",
+    )
+    if include_judgment:
+        st.caption("番号の色が判定です。外すと、場所と筆の形だけを赤で表示します。")
+    else:
+        st.caption("場所と筆の形だけを、赤で表示しています。")
     st.caption("番号は、文面と航空写真で同じです。文面は右上からコピーして、写真と一緒に送れます。")
-    st.code(_share_message(items, _missed_labels(records)), language=None)
+    st.code(_share_message(items, _missed_labels(records), include_judgment), language=None)
     try:
         with st.spinner("航空写真を作っています…"):
-            photo = _share_photo(items)
+            photo = _share_photo(items, include_judgment)
     except (OSError, TimeoutError, urllib.error.URLError):
         st.error("航空写真を作れませんでした。上の文面のリンクから場所を開けます。")
         return
     st.image(photo, width="stretch")
+    if include_judgment:
+        download_label = "判定つき航空写真をダウンロード"
+        download_name = "判定つき航空写真.jpg"
+    else:
+        download_label = "場所の航空写真をダウンロード"
+        download_name = "場所の航空写真.jpg"
     st.download_button(
-        "判定つき航空写真をダウンロード",
+        download_label,
         data=photo,
-        file_name="判定つき航空写真.jpg",
+        file_name=download_name,
         mime="image/jpeg",
         key="share_photo_download",
     )
