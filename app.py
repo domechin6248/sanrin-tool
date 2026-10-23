@@ -1110,18 +1110,22 @@ def _share_page_url(token: str) -> str:
 def _render_share_map(items: list[dict], state_key: str) -> None:
     """すべての筆を一つの航空写真に載せ、拡大・縮小と移動ができるようにする。"""
     choice = "全体を表示"
-    labels = [f"{item['number']}. {item['name']}" for item in items]
+    place_labels = [f"{item['number']}. {item['name']}" for item in items]
     if len(items) > 1:
+        choice_key = f"{state_key}_choice"
+        options = ["全体を表示"] + place_labels
+        if st.session_state.get(choice_key) not in options:
+            st.session_state[choice_key] = "全体を表示"
         choice = st.selectbox(
             "見る場所",
-            ["全体を表示"] + labels,
-            key=f"{state_key}_choice",
+            options,
+            key=choice_key,
         )
     lons: list[float] = []
     lats: list[float] = []
     polygons = []
     points = []
-    labels = []
+    marker_labels = []
     for item in items:
         lat = float(item["lat"])
         lon = float(item["lon"])
@@ -1151,12 +1155,14 @@ def _render_share_map(items: list[dict], state_key: str) -> None:
                 "label": label,
             }
         )
-        labels.append({"position": [lon, lat], "text": str(item["number"]), "label": label})
+        marker_labels.append({"position": [lon, lat], "text": str(item["number"]), "label": label})
 
+    if choice not in place_labels:
+        choice = "全体を表示"
     if choice == "全体を表示":
         mid_lat, mid_lon, zoom = _view_for_points(lons, lats, 4)
     else:
-        selected = items[labels.index(choice)]
+        selected = items[place_labels.index(choice)]
         mid_lat = float(selected["lat"])
         mid_lon = float(selected["lon"])
         zoom = 18
@@ -1193,7 +1199,7 @@ def _render_share_map(items: list[dict], state_key: str) -> None:
     layers.append(
         pdk.Layer(
             "TextLayer",
-            labels,
+            marker_labels,
             get_position="position",
             get_text="text",
             get_size=16,
