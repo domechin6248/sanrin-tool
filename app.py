@@ -1818,6 +1818,39 @@ def _show_quote_table(lines: list[dict]) -> None:
     )
 
 
+def _quote_editor_rows(raw_rows: object) -> list[dict]:
+    """入力表に残す行。空行も残し、見積キーには書き込まない。"""
+    if hasattr(raw_rows, "to_dict"):
+        records = raw_rows.to_dict("records")
+    else:
+        records = list(raw_rows or [])
+    cleaned = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        chiban_value = record.get("地番")
+        if chiban_value is None or (isinstance(chiban_value, float) and math.isnan(chiban_value)):
+            chiban = ""
+        else:
+            chiban = str(chiban_value)
+        tax_value = record.get("固定資産税額")
+        try:
+            if tax_value is None or (isinstance(tax_value, float) and math.isnan(tax_value)):
+                tax = 0
+            else:
+                tax = int(tax_value)
+        except (TypeError, ValueError):
+            tax = 0
+        if tax < 0:
+            tax = 0
+        cleaned.append(
+            {"地番": chiban, "固定資産税額": tax, "ハザード判定": _quote_zone(record.get("ハザード判定"))}
+        )
+    if not cleaned:
+        cleaned.append({"地番": "", "固定資産税額": 0, "ハザード判定": "通常"})
+    return cleaned
+
+
 def _show_quote() -> None:
     st.markdown("---")
     st.subheader("💴 引き取り費用の見積")
@@ -1829,6 +1862,8 @@ def _show_quote() -> None:
         st.session_state.quote_table = [
             {"地番": "", "固定資産税額": 0, "ハザード判定": "通常"},
         ]
+    # data_editor の key は読み取り専用。古い代入が残っていると表の表示で落ちる。
+    st.session_state.pop("quote_editor", None)
     if st.session_state.get("last_report") and st.button("判定結果の地番を見積へ入れる"):
         loaded = []
         for record in st.session_state.last_report:
@@ -1842,7 +1877,6 @@ def _show_quote() -> None:
             )
         if loaded:
             st.session_state.quote_table = loaded
-            st.session_state.quote_editor = loaded
             st.rerun()
     edited = st.data_editor(
         st.session_state.quote_table,
@@ -1866,8 +1900,8 @@ def _show_quote() -> None:
         num_rows="dynamic",
         hide_index=True,
         width="stretch",
-        key="quote_editor",
     )
+    st.session_state.quote_table = _quote_editor_rows(edited)
     rows = _quote_rows(edited)
     if not rows:
         st.info("地番を1件以上入れると、見積を計算します。")
