@@ -1818,91 +1818,141 @@ def _show_quote_table(lines: list[dict]) -> None:
     )
 
 
-def _quote_editor_rows(raw_rows: object) -> list[dict]:
-    """入力表に残す行。空行も残し、見積キーには書き込まない。"""
-    if hasattr(raw_rows, "to_dict"):
-        records = raw_rows.to_dict("records")
-    else:
-        records = list(raw_rows or [])
-    cleaned = []
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        chiban_value = record.get("地番")
-        if chiban_value is None or (isinstance(chiban_value, float) and math.isnan(chiban_value)):
-            chiban = ""
-        else:
-            chiban = str(chiban_value)
-        tax_value = record.get("固定資産税額")
-        try:
-            if tax_value is None or (isinstance(tax_value, float) and math.isnan(tax_value)):
-                tax = 0
-            else:
-                tax = int(tax_value)
-        except (TypeError, ValueError):
-            tax = 0
-        if tax < 0:
-            tax = 0
-        cleaned.append(
-            {"地番": chiban, "固定資産税額": tax, "ハザード判定": _quote_zone(record.get("ハザード判定"))}
+def _blank_quote_row() -> dict:
+    return {"地番": "", "固定資産税額": 0, "ハザード判定": "通常"}
+
+
+def _quote_tax_value(value: object) -> int:
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return 0
+        tax = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return tax if tax > 0 else 0
+
+
+def _quote_rows_from_widgets() -> list[dict]:
+    rows = []
+    index = 0
+    while f"quote_tax_{index}" in st.session_state:
+        rows.append(
+            {
+                "地番": str(st.session_state.get(f"quote_chiban_{index}") or ""),
+                "固定資産税額": _quote_tax_value(st.session_state.get(f"quote_tax_{index}")),
+                "ハザード判定": _quote_zone(st.session_state.get(f"quote_zone_{index}")),
+            }
         )
-    if not cleaned:
-        cleaned.append({"地番": "", "固定資産税額": 0, "ハザード判定": "通常"})
-    return cleaned
+        index += 1
+    return rows
+
+
+def _write_quote_widgets(rows: list[dict]) -> None:
+    """入力欄を描く前に呼ぶ。各筆の税額を手入力できる状態にする。"""
+    cleaned = [
+        {
+            "地番": str(row.get("地番") or ""),
+            "固定資産税額": _quote_tax_value(row.get("固定資産税額")),
+            "ハザード判定": _quote_zone(row.get("ハザード判定")),
+        }
+        for row in rows
+    ] or [_blank_quote_row()]
+    for index, row in enumerate(cleaned):
+        st.session_state[f"quote_chiban_{index}"] = row["地番"]
+        st.session_state[f"quote_tax_{index}"] = row["固定資産税額"]
+        st.session_state[f"quote_zone_{index}"] = row["ハザード判定"]
+    index = len(cleaned)
+    while f"quote_tax_{index}" in st.session_state:
+        for name in ("chiban", "tax", "zone"):
+            st.session_state.pop(f"quote_{name}_{index}", None)
+        index += 1
+    st.session_state.quote_table = cleaned
+
+
+def _add_quote_row() -> None:
+    rows = _quote_rows_from_widgets() or list(st.session_state.get("quote_table") or [])
+    rows.append(_blank_quote_row())
+    _write_quote_widgets(rows)
+
+
+def _delete_quote_row(index: int) -> None:
+    rows = _quote_rows_from_widgets() or list(st.session_state.get("quote_table") or [])
+    if 0 <= index < len(rows):
+        del rows[index]
+    _write_quote_widgets(rows)
+
+
+def _load_quote_from_report() -> None:
+    previous = {row["地番"]: row["固定資産税額"] for row in _quote_rows_from_widgets()}
+    loaded = []
+    for record in st.session_state.get("last_report") or []:
+        zone = _quote_zone(record["hazard"]["risk"]) if record.get("hazard") else "通常"
+        chiban = f"{record.get('town') or ''} {record.get('chiban') or ''}".strip()
+        loaded.append(
+            {
+                "地番": chiban,
+                "固定資産税額": previous.get(chiban, 0),
+                "ハザード判定": zone,
+            }
+        )
+    if loaded:
+        _write_quote_widgets(loaded)
 
 
 def _show_quote() -> None:
     st.markdown("---")
     st.subheader("💴 引き取り費用の見積")
     st.caption(
+        "各筆の固定資産税額（円）を入力してください。"
         "レッドは税額にかかわらず下限20万円×2.0、イエローは下限10万円×1.5です。"
         "基本枠は最大3筆、年間固定資産税の合計が10,000円以下で、合計が最も安くなる組み合わせを自動で選びます。"
     )
     if "quote_table" not in st.session_state:
-        st.session_state.quote_table = [
-            {"地番": "", "固定資産税額": 0, "ハザード判定": "通常"},
-        ]
-    # data_editor の key は読み取り専用。古い代入が残っていると表の表示で落ちる。
+        st.session_state.quote_table = [_blank_quote_row()]
     st.session_state.pop("quote_editor", None)
-    if st.session_state.get("last_report") and st.button("判定結果の地番を見積へ入れる"):
-        loaded = []
-        for record in st.session_state.last_report:
-            zone = _quote_zone(record["hazard"]["risk"]) if record.get("hazard") else "通常"
-            loaded.append(
-                {
-                    "地番": f"{record.get('town') or ''} {record.get('chiban') or ''}".strip(),
-                    "固定資産税額": 0,
-                    "ハザード判定": zone,
-                }
+    for index, row in enumerate(st.session_state.quote_table):
+        st.session_state.setdefault(f"quote_chiban_{index}", str(row.get("地番") or ""))
+        st.session_state.setdefault(f"quote_tax_{index}", _quote_tax_value(row.get("固定資産税額")))
+        st.session_state.setdefault(f"quote_zone_{index}", _quote_zone(row.get("ハザード判定")))
+    if st.session_state.get("last_report"):
+        st.button("判定結果の地番を見積へ入れる", on_click=_load_quote_from_report)
+    edited_rows = []
+    for index, _row in enumerate(st.session_state.quote_table):
+        with st.container(border=True):
+            title, remove = st.columns([4, 1])
+            title.markdown(f"**{index + 1}筆目**")
+            remove.button("削除", key=f"quote_del_{index}", on_click=_delete_quote_row, args=(index,))
+            chiban = st.text_input(
+                "地番",
+                key=f"quote_chiban_{index}",
+                placeholder="町名 地番",
             )
-        if loaded:
-            st.session_state.quote_table = loaded
-            st.rerun()
-    edited = st.data_editor(
-        st.session_state.quote_table,
-        column_config={
-            "地番": st.column_config.TextColumn("地番", width="medium"),
-            "固定資産税額": st.column_config.NumberColumn(
+            tax_column, zone_column = st.columns(2)
+            tax = tax_column.number_input(
                 "固定資産税額（円）",
                 min_value=0,
                 step=100,
                 format="%d",
-                width="small",
-            ),
-            "ハザード判定": st.column_config.SelectboxColumn(
+                key=f"quote_tax_{index}",
+            )
+            zone = zone_column.selectbox(
                 "ハザード判定",
-                options=["通常", "イエロー", "レッド"],
-                required=True,
-                width="small",
-            ),
-        },
-        column_order=["地番", "固定資産税額", "ハザード判定"],
-        num_rows="dynamic",
-        hide_index=True,
-        width="stretch",
-    )
-    st.session_state.quote_table = _quote_editor_rows(edited)
-    rows = _quote_rows(edited)
+                ["通常", "イエロー", "レッド"],
+                key=f"quote_zone_{index}",
+            )
+            amount, formula = _quote_amount(_quote_zone(zone), _quote_tax_value(tax))
+            st.write(f"この筆の引き取り費用　**{_yen_text(amount)}**")
+            st.caption(formula)
+            edited_rows.append(
+                {
+                    "地番": chiban,
+                    "固定資産税額": _quote_tax_value(tax),
+                    "ハザード判定": _quote_zone(zone),
+                }
+            )
+    st.session_state.quote_table = edited_rows or [_blank_quote_row()]
+    st.button("筆を追加", on_click=_add_quote_row)
+    rows = _quote_rows(edited_rows)
     if not rows:
         st.info("地番を1件以上入れると、見積を計算します。")
         return
