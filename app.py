@@ -701,25 +701,78 @@ def _lookup_town(address: str) -> dict:
     }
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def geocode_address(address: str, chiban: str) -> dict:
-    """住所と地番から、筆の内側の中心座標を返す。筆が無ければ町名の代表点に戻す。"""
-    address = address.strip()
-    chiban = chiban.strip()
-    queries: list[str] = []
+def _normalize_chiban(chiban: str) -> str:
+    """全角数字と各種ハイフンを、検索用の半角表記にそろえる。"""
+    return chiban.translate(str.maketrans("０１２３４５６７８９－−ーｰ‐―", "0123456789------")).strip()
+
+
+def _chiban_stems(chiban: str) -> list[str]:
+    """3302-4 のように枝番が付く地番から、親の地番を長い順に返す。"""
+    current = _normalize_chiban(chiban)
+    stems = []
+    while current:
+        cut = max((current.rfind(sep) for sep in ("-", "番", "の")), default=-1)
+        if cut <= 0:
+            break
+        head = current[:cut].strip()
+        if not head or not any(character.isdigit() for character in head):
+            break
+        if head not in stems:
+            stems.append(head)
+        current = head
+    return stems
+
+
+def _parcel_queries(address: str, chiban: str) -> list[str]:
+    queries = []
     if chiban and chiban not in address:
         queries.append(f"{address}{chiban}")
         queries.append(f"{address} {chiban}")
-    queries.append(address)
+    return queries
 
-    seen: list[str] = []
-    for query in queries:
-        if query not in seen:
-            seen.append(query)
-    for query in seen:
-        parcel = _lookup_parcel(query)
-        if parcel is not None:
-            return parcel
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def geocode_address(address: str, chiban: str) -> dict:
+    """住所と地番から、筆の内側の中心座標を返す。枝番が無ければ親の筆、それも無ければ町名の代表点。"""
+    address = address.strip()
+    original = chiban.strip()
+    normalized = _normalize_chiban(original)
+    search_chibans = []
+    for candidate in (original, normalized):
+        if candidate and candidate not in search_chibans:
+            search_chibans.append(candidate)
+
+    def find_exact(value: str) -> tuple[dict | None, dict | None]:
+        exact = None
+        nearby = None
+        for query in _parcel_queries(address, value):
+            parcel = _lookup_parcel(query)
+            if parcel is None:
+                continue
+            if parcel["precision"] == "parcel":
+                exact = parcel
+                break
+            nearby = nearby or parcel
+        return exact, nearby
+
+    nearby = None
+    for value in search_chibans:
+        exact, fallback = find_exact(value)
+        if exact is not None:
+            return exact
+        nearby = nearby or fallback
+
+    for stem in _chiban_stems(normalized or original):
+        exact, _fallback = find_exact(stem)
+        if exact is None:
+            continue
+        parent = dict(exact)
+        parent["precision"] = "parent"
+        parent["display_name"] = exact.get("display_name") or stem
+        return parent
+
+    if nearby is not None:
+        return nearby
     return _lookup_town(address)
 
 
@@ -963,6 +1016,8 @@ def _append_town_line(current: str, base: str, town: str, chibans: str) -> str:
 def _precision_note(precision: str, display_name: str) -> str:
     if precision == "parcel":
         return f"照合した地番：{display_name}"
+    if precision == "parent":
+        return f"枝番は備付地図に無かったため、親の筆を表示しています：{display_name}"
     if precision == "nearby":
         return f"近い筆：{display_name}"
     return f"筆は見つからず、町名の代表点です：{display_name}"
@@ -1038,6 +1093,8 @@ def _share_items(records: list[dict]) -> list[dict]:
         ]
         if location.get("precision") == "nearby":
             note = "指定の地番そのものではなく、近い筆の位置です。"
+        elif location.get("precision") == "parent":
+            note = "地番そのものは備付地図に無かったため、親の筆の位置です。"
         elif location.get("precision") == "town":
             note = "地番の筆は見つからず、町名の代表点です。"
         else:
@@ -1124,6 +1181,7 @@ _CODE_COLOR = {0: "#d63028", 1: "#2ea854", 2: "#f0b400", 3: "#d63028"}
 _NOTE_TEXT = {
     1: "指定の地番そのものではなく、近い筆の位置です。",
     2: "地番の筆は見つからず、町名の代表点です。",
+    3: "地番そのものは備付地図に無かったため、親の筆の位置です。",
 }
 
 
@@ -1138,6 +1196,8 @@ def _common_prefix(texts: list[str]) -> str:
 
 
 def _note_code(note: str) -> int:
+    if "親の筆" in note:
+        return 3
     if "近い" in note:
         return 1
     if "町名" in note:
@@ -1992,6 +2052,8 @@ def _show_report(records: list[dict]) -> None:
             st.success("✅ 調査が完了しました！")
             st.write(f"**対象：** {record['address']}　{record['chiban']}")
             if location["precision"] == "parcel":
+                st.caption(_precision_note(location["precision"], location["display_name"]))
+            elif location["precision"] == "parent":
                 st.caption(_precision_note(location["precision"], location["display_name"]))
             elif location["precision"] == "nearby":
                 st.caption(
