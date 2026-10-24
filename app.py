@@ -1923,6 +1923,34 @@ def _quote_plan(rows: list[dict]) -> dict:
     }
 
 
+_DOCS_APP_URL = "https://sanrin-renkei-hinagata.streamlit.app/"
+
+
+def _quote_doc_url(total: int, rows: list[dict]) -> str:
+    """見積の合計と対象地を、書類作成ツールへ渡すURLにする。"""
+    params: list[tuple[str, str]] = [("fee", str(total))]
+    report = {}
+    for record in st.session_state.get("last_report") or []:
+        label = f"{record.get('town') or ''} {record.get('chiban') or ''}".strip()
+        report[label] = record
+    for row in rows:
+        label = str(row.get("地番") or "").strip()
+        if not label or label == "（地番未入力）":
+            continue
+        record = report.get(label)
+        if record:
+            location = record.get("location") or {}
+            area = f"{location['area_m2']:.1f}" if location.get("area_m2") else ""
+            params.append(("land", "|".join([
+                str(record.get("address") or ""),
+                str(record.get("chiban") or ""),
+                area,
+            ])))
+        else:
+            params.append(("land", f"|{label}|"))
+    return _DOCS_APP_URL + "?" + urllib.parse.urlencode(params)
+
+
 def _show_quote_table(lines: list[dict]) -> None:
     st.dataframe(
         [{key: value for key, value in line.items() if not key.startswith("_")} for line in lines],
@@ -2076,6 +2104,9 @@ def _show_quote() -> None:
         return
     plan = _quote_plan(rows)
     st.metric("合計引き取り費用", _yen_text(plan["total"]))
+    if plan["total"] > 0:
+        st.link_button("この見積で書類を作る", _quote_doc_url(plan["total"], rows))
+        st.caption("書類作成ツールに、合計の引き取り費用と対象の土地が入ります。")
     with st.container(border=True):
         st.markdown("**基本枠の内訳**")
         st.caption(
