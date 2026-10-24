@@ -125,32 +125,122 @@ def _point_from_parcel_page(page_url: str) -> tuple[float, float] | None:
     return None
 
 
+def _geolonia_city_name(city: dict) -> str:
+    name = (city.get("city") or "").strip()
+    ward = (city.get("ward") or "").strip()
+    county = (city.get("county") or "").strip()
+    if ward:
+        return f"{name}{ward}"
+    if county:
+        return f"{county}{name}"
+    return name
+
+
+def _read_json(url: str):
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def _geolonia_directory() -> dict:
+    """登記所の一覧が取れないとき、住所データから都道府県と市区町村を組み立てる。"""
+    try:
+        payload = _read_json(f"{GEOLONIA_TOWN_URL}.json")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeError) as exc:
+        raise GeocodeError("住所の一覧を取得できませんでした。") from exc
+    prefectures = []
+    cities: dict[str, list[dict]] = {}
+    for row in payload.get("data") or []:
+        name = (row.get("pref") or "").strip()
+        code = str(row.get("code") or name)
+        if not name:
+            continue
+        prefectures.append({"code": code, "name": name})
+        city_rows = []
+        for city in row.get("cities") or []:
+            city_name = _geolonia_city_name(city)
+            if not city_name:
+                continue
+            city_rows.append({"code": str(city.get("code") or city_name), "name": city_name})
+        cities[name] = city_rows
+    if not prefectures:
+        raise GeocodeError("住所の一覧を取得できませんでした。")
+    return {"prefectures": prefectures, "cities": cities}
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def _address_prefectures() -> list[dict]:
     payload = _fetch_geonex_api("/cascade/prefectures")
-    if not isinstance(payload, dict):
-        return []
-    return [item for item in payload.get("prefectures") or [] if item.get("name") and item.get("code")]
+    items = []
+    if isinstance(payload, dict):
+        items = [
+            {"code": str(item["code"]), "name": item["name"]}
+            for item in payload.get("prefectures") or []
+            if item.get("name") and item.get("code")
+        ]
+    if not items:
+        items = _geolonia_directory()["prefectures"]
+    if not items:
+        raise GeocodeError("都道府県の一覧を取得できませんでした。")
+    return items
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def _address_cities(pref_code: str) -> list[dict]:
-    payload = _fetch_geonex_api(f"/cascade/cities?pref_code={pref_code}")
-    if not isinstance(payload, dict):
-        return []
-    return [item for item in payload.get("cities") or [] if item.get("name") and item.get("code")]
+def _address_cities(pref_code: str, pref_name: str) -> list[dict]:
+    payload = _fetch_geonex_api(f"/cascade/cities?pref_code={urllib.parse.quote(pref_code)}")
+    items = []
+    if isinstance(payload, dict):
+        items = [
+            {"code": str(item["code"]), "name": item["name"]}
+            for item in payload.get("cities") or []
+            if item.get("name") and item.get("code")
+        ]
+    if not items:
+        items = _geolonia_directory()["cities"].get(pref_name) or []
+    if not items:
+        raise GeocodeError("市区町村の一覧を取得できませんでした。")
+    return items
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def _address_towns(city_code: str) -> list[str]:
-    payload = _fetch_geonex_api(f"/cascade/oaza?city_code={city_code}")
-    if not isinstance(payload, dict):
-        return []
+def _town_names_from_rows(rows: list) -> list[str]:
     names = []
-    for item in payload.get("oaza") or []:
-        name = (item.get("name") or "").strip()
-        if name and name != "（地区なし）":
-            names.append(name)
+    seen = set()
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or item.get("oaza_cho") or item.get("koaza") or "").strip()
+        if not name or name == "（地区なし）" or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def _geolonia_towns(prefecture_name: str, city_name: str) -> list[str]:
+    path = f"{urllib.parse.quote(prefecture_name)}/{urllib.parse.quote(city_name)}.json"
+    try:
+        payload = _read_json(f"{GEOLONIA_TOWN_URL}/{path}")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeError) as exc:
+        raise GeocodeError("町名の一覧を取得できませんでした。") from exc
+    names = _town_names_from_rows(payload.get("data") or [])
+    if not names:
+        raise GeocodeError("町名の一覧を取得できませんでした。")
+    return names
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def _address_towns(city_code: str, prefecture_name: str, city_name: str) -> list[str]:
+    payload = _fetch_geonex_api(f"/cascade/oaza?city_code={urllib.parse.quote(city_code)}")
+    names = _town_names_from_rows(payload.get("oaza") or []) if isinstance(payload, dict) else []
+    if not names:
+        names = _geolonia_towns(prefecture_name, city_name)
+    if not names:
+        raise GeocodeError("町名の一覧を取得できませんでした。")
     return names
 
 
@@ -238,8 +328,8 @@ def _town_readings(prefecture_name: str, city_name: str) -> dict[str, str]:
         return {}
     readings = {}
     for row in payload.get("data") or []:
-        name = (row.get("oaza_cho") or "").strip()
-        kana = (row.get("oaza_cho_k") or "").strip()
+        name = (row.get("oaza_cho") or row.get("koaza") or "").strip()
+        kana = (row.get("oaza_cho_k") or row.get("koaza_k") or "").strip()
         if name and kana and name not in readings:
             readings[name] = kana
     return readings
@@ -1433,7 +1523,10 @@ base_address = ""
 default_town = ""
 known_towns: list[str] = []
 if address_mode == "リストから選ぶ":
-    prefectures = _address_prefectures()
+    try:
+        prefectures = _address_prefectures()
+    except GeocodeError:
+        prefectures = []
     if not prefectures:
         st.error("都道府県の一覧を取得できませんでした。自由入力に切り替えてください。")
     else:
@@ -1469,7 +1562,10 @@ if address_mode == "リストから選ぶ":
         prefecture_code = next(
             item["code"] for item in prefectures if item["name"] == prefecture_name
         )
-        cities = _address_cities(prefecture_code)
+        try:
+            cities = _address_cities(prefecture_code, prefecture_name)
+        except GeocodeError:
+            cities = []
         if not cities:
             st.error("市区町村の一覧を取得できませんでした。")
         else:
@@ -1502,7 +1598,10 @@ if address_mode == "リストから選ぶ":
                 key=f"address_city_{prefecture_code}_{city_row}",
             )
             city_code = next(item["code"] for item in cities if item["name"] == city_name)
-            town_names = _address_towns(city_code)
+            try:
+                town_names = _address_towns(city_code, prefecture_name, city_name)
+            except GeocodeError:
+                town_names = []
             if not town_names:
                 st.error("町名の一覧を取得できませんでした。")
             else:
@@ -1579,6 +1678,221 @@ parcel_text = st.text_area(
 if default_town:
     st.caption("町を選んで地番を書き、「この地番を追加」を押してください。別の町も同じ手順で一覧に足せます。")
 submitted = st.button("🔍 査定・ハザード調査を実行する", type="primary")
+
+# 引き取り費用。レッドとイエローは税額より下限が優先され、倍率は基本枠の中で割増になる。
+_QUOTE_BASIC_PARCELS = 3
+_QUOTE_BASIC_TAX_LIMIT = 10_000
+_QUOTE_RED_FLOOR = 200_000
+_QUOTE_RED_RATE = 2.0
+_QUOTE_YELLOW_FLOOR = 100_000
+_QUOTE_YELLOW_RATE = 1.5
+
+
+def _quote_yen(value: float) -> int:
+    return int(value + 0.5) if value >= 0 else int(value - 0.5)
+
+
+def _yen_text(amount: int) -> str:
+    return f"{amount:,}円"
+
+
+def _quote_zone(value: object) -> str:
+    text = str(value or "").strip()
+    if "レッド" in text or "危険" in text or "特別" in text:
+        return "レッド"
+    if "イエロー" in text or "警戒" in text:
+        return "イエロー"
+    return "通常"
+
+
+def _quote_amount(zone: str, tax: int) -> tuple[int, str]:
+    """税額にかかわらず下限を置き、ハザード倍率を掛ける。"""
+    if zone == "レッド":
+        basis = max(tax, _QUOTE_RED_FLOOR)
+        amount = _quote_yen(basis * _QUOTE_RED_RATE)
+        source = (
+            f"固定資産税額 {_yen_text(tax)}"
+            if tax > _QUOTE_RED_FLOOR
+            else f"下限 {_yen_text(_QUOTE_RED_FLOOR)}"
+        )
+        return amount, f"{source} × {_QUOTE_RED_RATE:.1f}"
+    if zone == "イエロー":
+        basis = max(tax, _QUOTE_YELLOW_FLOOR)
+        amount = _quote_yen(basis * _QUOTE_YELLOW_RATE)
+        source = (
+            f"固定資産税額 {_yen_text(tax)}"
+            if tax > _QUOTE_YELLOW_FLOOR
+            else f"下限 {_yen_text(_QUOTE_YELLOW_FLOOR)}"
+        )
+        return amount, f"{source} × {_QUOTE_YELLOW_RATE:.1f}"
+    return tax, f"固定資産税額 {_yen_text(tax)}"
+
+
+def _quote_rows(raw_rows: object) -> list[dict]:
+    if hasattr(raw_rows, "to_dict"):
+        records = raw_rows.to_dict("records")
+    else:
+        records = list(raw_rows or [])
+    rows = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        chiban = str(record.get("地番") or "").strip()
+        tax_value = record.get("固定資産税額")
+        try:
+            tax = int(tax_value or 0)
+        except (TypeError, ValueError):
+            tax = 0
+        if tax < 0:
+            tax = 0
+        zone = _quote_zone(record.get("ハザード判定"))
+        if not chiban and tax == 0 and zone == "通常":
+            continue
+        rows.append({"地番": chiban or "（地番未入力）", "固定資産税額": tax, "ハザード判定": zone})
+    return rows
+
+
+def _quote_plan(rows: list[dict]) -> dict:
+    """3筆以内・税額合計1万円以下の基本枠のうち、合計が最も安い組み合わせを選ぶ。"""
+    priced = []
+    for index, row in enumerate(rows):
+        amount, formula = _quote_amount(row["ハザード判定"], row["固定資産税額"])
+        priced.append({**row, "index": index, "amount": amount, "formula": formula})
+
+    def candidates(size: int, start: int, chosen: tuple[int, ...]):
+        if len(chosen) == size:
+            yield chosen
+            return
+        for index in range(start, len(priced)):
+            yield from candidates(size, index + 1, chosen + (index,))
+
+    best_key = None
+    best_frame: tuple[int, ...] = ()
+    for size in range(0, min(_QUOTE_BASIC_PARCELS, len(priced)) + 1):
+        for frame in candidates(size, 0, ()):
+            tax_sum = sum(priced[index]["固定資産税額"] for index in frame)
+            if tax_sum > _QUOTE_BASIC_TAX_LIMIT:
+                continue
+            total = sum(item["amount"] for item in priced)
+            hazard_inside = sum(1 for index in frame if priced[index]["ハザード判定"] != "通常")
+            # 金額が同じなら、割増のある筆を基本枠へ入れ、入る筆数を多くする。
+            key = (total, -hazard_inside, -len(frame), tax_sum, frame)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_frame = frame
+
+    frame_indexes = set(best_frame)
+    frame_lines = []
+    extra_lines = []
+    for item in priced:
+        line = {
+            "地番": item["地番"],
+            "ハザード判定": item["ハザード判定"],
+            "固定資産税額": _yen_text(item["固定資産税額"]),
+            "計算": item["formula"] + ("（基本枠内の割増）" if item["index"] in frame_indexes and item["ハザード判定"] != "通常" else ""),
+            "金額": _yen_text(item["amount"]),
+            "_amount": item["amount"],
+        }
+        if item["index"] in frame_indexes:
+            frame_lines.append(line)
+        else:
+            extra_lines.append(line)
+    frame_subtotal = sum(line["_amount"] for line in frame_lines)
+    extra_subtotal = sum(line["_amount"] for line in extra_lines)
+    frame_tax = sum(priced[index]["固定資産税額"] for index in best_frame)
+    return {
+        "frame_lines": frame_lines,
+        "extra_lines": extra_lines,
+        "frame_subtotal": frame_subtotal,
+        "extra_subtotal": extra_subtotal,
+        "frame_tax": frame_tax,
+        "total": frame_subtotal + extra_subtotal,
+    }
+
+
+def _show_quote_table(lines: list[dict]) -> None:
+    st.dataframe(
+        [{key: value for key, value in line.items() if not key.startswith("_")} for line in lines],
+        hide_index=True,
+        width="stretch",
+    )
+
+
+def _show_quote() -> None:
+    st.markdown("---")
+    st.subheader("💴 引き取り費用の見積")
+    st.caption(
+        "レッドは税額にかかわらず下限20万円×2.0、イエローは下限10万円×1.5です。"
+        "基本枠は最大3筆、年間固定資産税の合計が10,000円以下で、合計が最も安くなる組み合わせを自動で選びます。"
+    )
+    if "quote_table" not in st.session_state:
+        st.session_state.quote_table = [
+            {"地番": "", "固定資産税額": 0, "ハザード判定": "通常"},
+        ]
+    if st.session_state.get("last_report") and st.button("判定結果の地番を見積へ入れる"):
+        loaded = []
+        for record in st.session_state.last_report:
+            zone = _quote_zone(record["hazard"]["risk"]) if record.get("hazard") else "通常"
+            loaded.append(
+                {
+                    "地番": f"{record.get('town') or ''} {record.get('chiban') or ''}".strip(),
+                    "固定資産税額": 0,
+                    "ハザード判定": zone,
+                }
+            )
+        if loaded:
+            st.session_state.quote_table = loaded
+            st.session_state.quote_editor = loaded
+            st.rerun()
+    edited = st.data_editor(
+        st.session_state.quote_table,
+        column_config={
+            "地番": st.column_config.TextColumn("地番", width="medium"),
+            "固定資産税額": st.column_config.NumberColumn(
+                "固定資産税額（円）",
+                min_value=0,
+                step=100,
+                format="%d",
+                width="small",
+            ),
+            "ハザード判定": st.column_config.SelectboxColumn(
+                "ハザード判定",
+                options=["通常", "イエロー", "レッド"],
+                required=True,
+                width="small",
+            ),
+        },
+        column_order=["地番", "固定資産税額", "ハザード判定"],
+        num_rows="dynamic",
+        hide_index=True,
+        width="stretch",
+        key="quote_editor",
+    )
+    rows = _quote_rows(edited)
+    if not rows:
+        st.info("地番を1件以上入れると、見積を計算します。")
+        return
+    plan = _quote_plan(rows)
+    st.metric("合計引き取り費用", _yen_text(plan["total"]))
+    with st.container(border=True):
+        st.markdown("**基本枠の内訳**")
+        st.caption(
+            f"{len(plan['frame_lines'])}筆 / 最大{_QUOTE_BASIC_PARCELS}筆　"
+            f"固定資産税の合計 {_yen_text(plan['frame_tax'])} / 上限 {_yen_text(_QUOTE_BASIC_TAX_LIMIT)}"
+        )
+        if plan["frame_lines"]:
+            _show_quote_table(plan["frame_lines"])
+            st.write(f"基本枠の小計　**{_yen_text(plan['frame_subtotal'])}**")
+        else:
+            st.write("基本枠に入る筆はありません。税額の合計が1万円を超える筆は、追加として計算しています。")
+    with st.container(border=True):
+        st.markdown("**4筆目以降の追加内訳**")
+        if plan["extra_lines"]:
+            _show_quote_table(plan["extra_lines"])
+            st.write(f"追加の小計　**{_yen_text(plan['extra_subtotal'])}**")
+        else:
+            st.write("追加の筆はありません。")
+
 
 def _show_report(records: list[dict]) -> None:
     total = len(records)
@@ -1786,3 +2100,5 @@ if submitted:
 
 if st.session_state.get("last_report"):
     _show_report(st.session_state.last_report)
+
+_show_quote()
