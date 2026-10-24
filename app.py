@@ -1742,6 +1742,7 @@ submitted = st.button("🔍 査定・ハザード調査を実行する", type="p
 # 引き取り費用。レッドとイエローは税額より下限が優先され、倍率は基本枠の中で割増になる。
 _QUOTE_BASIC_PARCELS = 3
 _QUOTE_BASIC_TAX_LIMIT = 10_000
+_QUOTE_BASIC_FEE = 300_000
 _QUOTE_RED_FLOOR = 200_000
 _QUOTE_RED_RATE = 2.0
 _QUOTE_YELLOW_FLOOR = 100_000
@@ -1766,7 +1767,7 @@ def _quote_zone(value: object) -> str:
 
 
 def _quote_amount(zone: str, tax: int) -> tuple[int, str]:
-    """税額にかかわらず下限を置き、ハザード倍率を掛ける。"""
+    """イエローとレッドだけ、税額より下限を優先して倍率を掛ける。"""
     if zone == "レッド":
         basis = max(tax, _QUOTE_RED_FLOOR)
         amount = _quote_yen(basis * _QUOTE_RED_RATE)
@@ -1785,7 +1786,22 @@ def _quote_amount(zone: str, tax: int) -> tuple[int, str]:
             else f"下限 {_yen_text(_QUOTE_YELLOW_FLOOR)}"
         )
         return amount, f"{source} × {_QUOTE_YELLOW_RATE:.1f}"
-    return tax, f"固定資産税額 {_yen_text(tax)}"
+    return 0, ""
+
+
+def _quote_extra_amount(tax: int) -> tuple[int, str]:
+    """4筆目以降の通常の筆。年間固定資産税額の区分で加算する。"""
+    if tax <= 0:
+        return 100_000, "免税点未満（非課税）"
+    if tax <= 1_500:
+        return 50_000, "固定資産税額 1,500円以下"
+    steps = math.ceil((tax - 1_500) / 1_500)
+    amount = 50_000 * (steps + 1)
+    band_end = 1_500 * (steps + 1)
+    band_start = band_end - 1_499
+    if tax >= 21_001:
+        return amount, f"{_yen_text(band_start)}〜{_yen_text(band_end)}（1,500円ごとに＋50,000円）"
+    return amount, f"固定資産税額 {_yen_text(band_start)}〜{_yen_text(band_end)}"
 
 
 def _quote_rows(raw_rows: object) -> list[dict]:
@@ -1813,11 +1829,11 @@ def _quote_rows(raw_rows: object) -> list[dict]:
 
 
 def _quote_plan(rows: list[dict]) -> dict:
-    """3筆以内・税額合計1万円以下の基本枠のうち、合計が最も安い組み合わせを選ぶ。"""
+    """通常は料金表、イエローとレッドは特別料金。基本枠は合計が最も安い組み合わせ。"""
     priced = []
     for index, row in enumerate(rows):
         amount, formula = _quote_amount(row["ハザード判定"], row["固定資産税額"])
-        priced.append({**row, "index": index, "amount": amount, "formula": formula})
+        priced.append({**row, "index": index, "hazard_amount": amount, "hazard_formula": formula})
 
     def candidates(size: int, start: int, chosen: tuple[int, ...]):
         if len(chosen) == size:
@@ -1826,14 +1842,31 @@ def _quote_plan(rows: list[dict]) -> dict:
         for index in range(start, len(priced)):
             yield from candidates(size, index + 1, chosen + (index,))
 
+    def total_for(frame: tuple[int, ...]) -> int:
+        inside = set(frame)
+        basic = _QUOTE_BASIC_FEE if any(priced[index]["ハザード判定"] == "通常" for index in inside) else 0
+        hazard = sum(item["hazard_amount"] for item in priced)
+        extra = 0
+        for item in priced:
+            if item["index"] in inside or item["ハザード判定"] != "通常":
+                continue
+            fee, _formula = _quote_extra_amount(item["固定資産税額"])
+            extra += fee
+        return basic + hazard + extra
+
+    must_cover_normal = any(
+        item["ハザード判定"] == "通常" and item["固定資産税額"] <= _QUOTE_BASIC_TAX_LIMIT for item in priced
+    )
     best_key = None
     best_frame: tuple[int, ...] = ()
     for size in range(0, min(_QUOTE_BASIC_PARCELS, len(priced)) + 1):
         for frame in candidates(size, 0, ()):
+            if must_cover_normal and not any(priced[index]["ハザード判定"] == "通常" for index in frame):
+                continue
             tax_sum = sum(priced[index]["固定資産税額"] for index in frame)
             if tax_sum > _QUOTE_BASIC_TAX_LIMIT:
                 continue
-            total = sum(item["amount"] for item in priced)
+            total = total_for(frame)
             hazard_inside = sum(1 for index in frame if priced[index]["ハザード判定"] != "通常")
             # 金額が同じなら、割増のある筆を基本枠へ入れ、入る筆数を多くする。
             key = (total, -hazard_inside, -len(frame), tax_sum, frame)
@@ -1842,16 +1875,35 @@ def _quote_plan(rows: list[dict]) -> dict:
                 best_frame = frame
 
     frame_indexes = set(best_frame)
+    normals = [item for item in priced if item["index"] in frame_indexes and item["ハザード判定"] == "通常"]
     frame_lines = []
+    if normals:
+        frame_lines.append(
+            {
+                "地番": "、".join(item["地番"] for item in normals),
+                "ハザード判定": "通常",
+                "固定資産税額": _yen_text(sum(item["固定資産税額"] for item in normals)),
+                "計算": f"基本引き取り料金（{len(normals)}筆・税込）",
+                "金額": _yen_text(_QUOTE_BASIC_FEE),
+                "_amount": _QUOTE_BASIC_FEE,
+            }
+        )
     extra_lines = []
     for item in priced:
+        if item["ハザード判定"] == "通常" and item["index"] in frame_indexes:
+            continue
+        if item["ハザード判定"] == "通常":
+            amount, formula = _quote_extra_amount(item["固定資産税額"])
+        else:
+            amount = item["hazard_amount"]
+            formula = item["hazard_formula"] + ("（基本枠内の割増）" if item["index"] in frame_indexes else "")
         line = {
             "地番": item["地番"],
             "ハザード判定": item["ハザード判定"],
             "固定資産税額": _yen_text(item["固定資産税額"]),
-            "計算": item["formula"] + ("（基本枠内の割増）" if item["index"] in frame_indexes and item["ハザード判定"] != "通常" else ""),
-            "金額": _yen_text(item["amount"]),
-            "_amount": item["amount"],
+            "計算": formula,
+            "金額": _yen_text(amount),
+            "_amount": amount,
         }
         if item["index"] in frame_indexes:
             frame_lines.append(line)
@@ -1863,6 +1915,7 @@ def _quote_plan(rows: list[dict]) -> dict:
     return {
         "frame_lines": frame_lines,
         "extra_lines": extra_lines,
+        "frame_count": len(best_frame),
         "frame_subtotal": frame_subtotal,
         "extra_subtotal": extra_subtotal,
         "frame_tax": frame_tax,
@@ -1964,8 +2017,9 @@ def _show_quote() -> None:
     st.subheader("💴 引き取り費用の見積")
     st.caption(
         "各筆の固定資産税額（円）を入力してください。"
-        "レッドは税額にかかわらず下限20万円×2.0、イエローは下限10万円×1.5です。"
-        "基本枠は最大3筆、年間固定資産税の合計が10,000円以下で、合計が最も安くなる組み合わせを自動で選びます。"
+        "通常は、最大3筆かつ年間固定資産税の合計が1万円以下で基本料金30万円（税込）です。"
+        "収まらない筆は税額の区分で加算します。"
+        "レッドは下限20万円×2.0、イエローは下限10万円×1.5です。"
     )
     if "quote_table" not in st.session_state:
         st.session_state.quote_table = [_blank_quote_row()]
@@ -2000,9 +2054,13 @@ def _show_quote() -> None:
                 ["通常", "イエロー", "レッド"],
                 key=f"quote_zone_{index}",
             )
-            amount, formula = _quote_amount(_quote_zone(zone), _quote_tax_value(tax))
-            st.write(f"この筆の引き取り費用　**{_yen_text(amount)}**")
-            st.caption(formula)
+            zone_name = _quote_zone(zone)
+            if zone_name == "通常":
+                st.caption("通常の筆は、下の基本料金30万円、または4筆目以降の追加料金で計算します。")
+            else:
+                amount, formula = _quote_amount(zone_name, _quote_tax_value(tax))
+                st.write(f"この筆の引き取り費用　**{_yen_text(amount)}**")
+                st.caption(formula)
             edited_rows.append(
                 {
                     "地番": chiban,
@@ -2021,7 +2079,7 @@ def _show_quote() -> None:
     with st.container(border=True):
         st.markdown("**基本枠の内訳**")
         st.caption(
-            f"{len(plan['frame_lines'])}筆 / 最大{_QUOTE_BASIC_PARCELS}筆　"
+            f"{plan['frame_count']}筆 / 最大{_QUOTE_BASIC_PARCELS}筆　"
             f"固定資産税の合計 {_yen_text(plan['frame_tax'])} / 上限 {_yen_text(_QUOTE_BASIC_TAX_LIMIT)}"
         )
         if plan["frame_lines"]:
