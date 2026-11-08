@@ -1570,6 +1570,12 @@ if _shared_places is not None:
 
 st.title("🌲 ハザード自動判定ツール")
 st.write("住所と地番を入力して、一次スクリーニング（災害リスク判定）を行います。")
+st.text_input(
+    "受付番号（任意）",
+    placeholder="0001",
+    key="receipt_no",
+    help="入れると、書類作成ツールの受付番号に入ります。空欄のままでも調査できます。",
+)
 
 # --- 入力フォーム ---
 st.subheader("📍 査定物件の入力")
@@ -1929,6 +1935,9 @@ _DOCS_APP_URL = "https://sanrin-renkei-hinagata.streamlit.app/"
 def _quote_doc_url(total: int, rows: list[dict]) -> str:
     """見積の合計と対象地を、書類作成ツールへ渡すURLにする。"""
     params: list[tuple[str, str]] = [("fee", str(total))]
+    receipt = str(st.session_state.get("receipt_no") or "").strip()
+    if receipt:
+        params.append(("receipt", receipt))
     report = {}
     for record in st.session_state.get("last_report") or []:
         label = f"{record.get('town') or ''} {record.get('chiban') or ''}".strip()
@@ -2106,7 +2115,7 @@ def _show_quote() -> None:
     st.metric("合計引き取り費用", _yen_text(plan["total"]))
     if plan["total"] > 0:
         st.link_button("この見積で書類を作る", _quote_doc_url(plan["total"], rows))
-        st.caption("書類作成ツールに、合計の引き取り費用と対象の土地が入ります。")
+        st.caption("書類作成ツールに、合計の引き取り費用、対象の土地、入力した受付番号が入ります。")
     with st.container(border=True):
         st.markdown("**基本枠の内訳**")
         st.caption(
