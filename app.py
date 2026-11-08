@@ -1972,14 +1972,23 @@ def _blank_quote_row() -> dict:
     return {"地番": "", "固定資産税額": 0, "ハザード判定": "通常"}
 
 
+def _quote_tax_text(value: object) -> str:
+    """固定資産税の入力を、先頭の0がない半角数字にする。未入力は空欄。"""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            return ""
+        number = int(value)
+        return "" if number <= 0 else str(number)
+    text = str(value or "").translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits.lstrip("0")
+
+
 def _quote_tax_value(value: object) -> int:
-    try:
-        if value is None or (isinstance(value, float) and math.isnan(value)):
-            return 0
-        tax = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return tax if tax > 0 else 0
+    text = _quote_tax_text(value)
+    return int(text) if text else 0
 
 
 def _quote_rows_from_widgets() -> list[dict]:
@@ -2009,7 +2018,7 @@ def _write_quote_widgets(rows: list[dict]) -> None:
     ] or [_blank_quote_row()]
     for index, row in enumerate(cleaned):
         st.session_state[f"quote_chiban_{index}"] = row["地番"]
-        st.session_state[f"quote_tax_{index}"] = row["固定資産税額"]
+        st.session_state[f"quote_tax_{index}"] = _quote_tax_text(row["固定資産税額"])
         st.session_state[f"quote_zone_{index}"] = row["ハザード判定"]
     index = len(cleaned)
     while f"quote_tax_{index}" in st.session_state:
@@ -2063,8 +2072,9 @@ def _show_quote() -> None:
     st.session_state.pop("quote_editor", None)
     for index, row in enumerate(st.session_state.quote_table):
         st.session_state.setdefault(f"quote_chiban_{index}", str(row.get("地番") or ""))
-        st.session_state.setdefault(f"quote_tax_{index}", _quote_tax_value(row.get("固定資産税額")))
         st.session_state.setdefault(f"quote_zone_{index}", _quote_zone(row.get("ハザード判定")))
+        tax_key = f"quote_tax_{index}"
+        st.session_state[tax_key] = _quote_tax_text(st.session_state.get(tax_key, row.get("固定資産税額")))
     if st.session_state.get("last_report"):
         st.button("判定結果の地番を見積へ入れる", on_click=_load_quote_from_report)
     edited_rows = []
@@ -2079,12 +2089,10 @@ def _show_quote() -> None:
                 placeholder="町名 地番",
             )
             tax_column, zone_column = st.columns(2)
-            tax = tax_column.number_input(
+            tax = tax_column.text_input(
                 "固定資産税額（円）",
-                min_value=0,
-                step=100,
-                format="%d",
                 key=f"quote_tax_{index}",
+                placeholder="3000",
             )
             zone = zone_column.selectbox(
                 "ハザード判定",
