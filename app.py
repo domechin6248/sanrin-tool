@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import math
+import os
 import struct
 import urllib.error
 import urllib.parse
@@ -13,6 +14,33 @@ import streamlit as st
 from PIL import Image
 
 USER_AGENT = "sanrin-hazard-mini-tool/1.0 (local streamlit demo)"
+
+
+def _setting(name: str, default: str = "") -> str:
+    """環境変数、次に Streamlit の secrets から設定値を読む（どちらも無ければ default）。"""
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    try:
+        return str(st.secrets.get(name, "") or "").strip()
+    except Exception:  # secrets.toml が無い場合
+        return default
+
+
+def _normalized_url(url: str) -> str:
+    """末尾を「/」にそろえる。スキームが無ければ https:// を付ける。"""
+    url = url.strip()
+    if not url:
+        return ""
+    if "://" not in url:
+        url = "https://" + url
+    return url if url.endswith("/") else url + "/"
+
+
+# 公開URLの既定値。独自ドメインへ移したら、環境変数または secrets の
+# APP_BASE_URL（このツール）、DOCS_APP_URL（書類作成ツール）で上書きする。
+_DEFAULT_APP_URL = "https://domechin6248-sanrin-tool-app-brsaqj.streamlit.app/"
+_DEFAULT_DOCS_APP_URL = "https://sanrin-renkei-hinagata.streamlit.app/"
 GSI_URL = "https://msearch.gsi.go.jp/address-search/AddressSearch"
 GEONEX_LOOKUP_URL = "https://geonex-maps.com/lookup"
 GEONEX_API_URL = "https://geonex-maps.com/api"
@@ -1359,6 +1387,9 @@ def _decode_places(token: str) -> tuple[list[dict], bool]:
 
 
 def _app_base_url() -> str:
+    configured = _normalized_url(_setting("APP_BASE_URL"))
+    if configured:
+        return configured
     current = ""
     try:
         current = str(st.context.url or "")
@@ -1367,7 +1398,7 @@ def _app_base_url() -> str:
     parsed = urllib.parse.urlparse(current) if current else None
     if parsed and parsed.scheme and parsed.netloc:
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-    return "https://domechin6248-sanrin-tool-app-brsaqj.streamlit.app/"
+    return _DEFAULT_APP_URL
 
 
 def _share_page_url(token: str) -> str:
@@ -1929,8 +1960,6 @@ def _quote_plan(rows: list[dict]) -> dict:
     }
 
 
-_DOCS_APP_URL = "https://sanrin-renkei-hinagata.streamlit.app/"
-
 
 def _quote_doc_url(total: int, rows: list[dict]) -> str:
     """見積の合計と対象地を、書類作成ツールへ渡すURLにする。"""
@@ -1957,7 +1986,8 @@ def _quote_doc_url(total: int, rows: list[dict]) -> str:
             ])))
         else:
             params.append(("land", f"|{label}|"))
-    return _DOCS_APP_URL + "?" + urllib.parse.urlencode(params)
+    docs_url = _normalized_url(_setting("DOCS_APP_URL")) or _DEFAULT_DOCS_APP_URL
+    return docs_url + "?" + urllib.parse.urlencode(params)
 
 
 def _show_quote_table(lines: list[dict]) -> None:
