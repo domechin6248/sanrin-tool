@@ -28,19 +28,20 @@ def _setting(name: str, default: str = "") -> str:
 
 
 def _normalized_url(url: str) -> str:
-    """末尾を「/」にそろえる。スキームが無ければ https:// を付ける。"""
+    """末尾の「/」を除く。スキームが無ければ https:// を付ける。"""
     url = url.strip()
     if not url:
         return ""
     if "://" not in url:
         url = "https://" + url
-    return url if url.endswith("/") else url + "/"
+    return url.rstrip("/")
 
 
-# 公開URLの既定値。独自ドメインへ移したら、環境変数または secrets の
-# APP_BASE_URL（このツール）、DOCS_APP_URL（書類作成ツール）で上書きする。
-_DEFAULT_APP_URL = "https://domechin6248-sanrin-tool-app-brsaqj.streamlit.app/"
-_DEFAULT_DOCS_APP_URL = "https://sanrin-renkei-hinagata.streamlit.app/"
+# 公開URLの既定値（自社サイトのURL）。自社サイト側（Firebase Hosting の redirects）が
+# 実際のアプリへ転送するので、移転先が変わっても、お客様へ案内するURLは変わらない。
+# 環境変数または secrets の APP_BASE_URL（このツール）、DOCS_APP_URL（書類作成ツール）で上書きできる。
+_DEFAULT_APP_URL = "https://sanrin-partners.com/hazard"
+_DEFAULT_DOCS_APP_URL = "https://sanrin-partners.com/shorui"
 GSI_URL = "https://msearch.gsi.go.jp/address-search/AddressSearch"
 GEONEX_LOOKUP_URL = "https://geonex-maps.com/lookup"
 GEONEX_API_URL = "https://geonex-maps.com/api"
@@ -1390,14 +1391,15 @@ def _app_base_url() -> str:
     configured = _normalized_url(_setting("APP_BASE_URL"))
     if configured:
         return configured
+    # 手元（localhost）で動かしているときだけ、開いているURLをそのまま使う。
     current = ""
     try:
         current = str(st.context.url or "")
     except AttributeError:
         current = ""
     parsed = urllib.parse.urlparse(current) if current else None
-    if parsed and parsed.scheme and parsed.netloc:
-        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    if parsed and parsed.hostname in ("localhost", "127.0.0.1"):
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
     return _DEFAULT_APP_URL
 
 
