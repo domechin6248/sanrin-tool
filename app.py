@@ -1129,6 +1129,8 @@ def _precision_note(precision: str, display_name: str) -> str:
         return f"照合した地番：{display_name}"
     if precision == "parent":
         return f"枝番は備付地図に無かったため、親の筆を表示しています：{display_name}"
+    if precision == "manual":
+        return f"指定された位置です：{display_name}"
     if precision == "banchi":
         return f"備付地図に位置が無いため、同じ番号の番地の位置（近似）です。筆の実際の位置とずれることがあります：{display_name}"
     if precision == "nearby":
@@ -1168,6 +1170,36 @@ def _google_maps_url(lat: float, lon: float) -> str:
     return f"https://www.google.com/maps/search/?{query}"
 
 
+def _mapple_url(lat: float, lon: float, zoom: int = 16) -> str:
+    """MAPPLE法務局地図ビューアを、指定の位置で開くリンク（リンクを開くだけで、データは取り込まない）。"""
+    return f"https://labs.mapple.com/mapplexml.html#{zoom}.00/{lat:.8f}/{lon:.8f}"
+
+
+_LOCATION_PATTERNS = (
+    r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)",  # Googleマップ（ピンの位置）
+    r"@(-?\d+\.\d+),(-?\d+\.\d+)",  # Googleマップ（地図の中心）
+    r"#\d+(?:\.\d+)?/(-?\d+\.\d+)/(-?\d+\.\d+)",  # 地理院地図・MAPPLE
+    r"[?&]lat=(-?\d+\.\d+)&(?:lon|lng)=(-?\d+\.\d+)",  # Yahoo!地図など
+    r"[?&](?:ll|q|query|center)=(-?\d+\.\d+)(?:,|%2C)(-?\d+\.\d+)",
+    r"(-?\d+\.\d+)\s*[,\s]\s*(-?\d+\.\d+)",  # 「31.78, 130.39」
+)
+
+
+def _parse_location_text(text: str) -> tuple[float, float] | None:
+    """緯度経度、または地図サービスのURLから（緯度, 経度）を読む。日本国内の値だけ受け付ける。"""
+    flat = unicodedata.normalize("NFKC", text or "").strip()
+    if not flat:
+        return None
+    for pattern in _LOCATION_PATTERNS:
+        for match in re.finditer(pattern, flat):
+            first, second = float(match.group(1)), float(match.group(2))
+            if 20 <= first <= 46 and 122 <= second <= 154:
+                return first, second
+            if 20 <= second <= 46 and 122 <= first <= 154:
+                return second, first
+    return None
+
+
 def _share_color(risk: str) -> str:
     if "安全" in risk:
         return "#2ea854"
@@ -1204,7 +1236,9 @@ def _share_items(records: list[dict]) -> list[dict]:
             [float(point[1]), float(point[0])]
             for point in (location.get("polygon") or [])
         ]
-        if location.get("precision") == "banchi":
+        if location.get("precision") == "manual":
+            note = "指定された位置です。"
+        elif location.get("precision") == "banchi":
             note = "備付地図に位置が無いため、同じ番号の番地の位置（近似）です。"
         elif location.get("precision") == "nearby":
             note = "指定の地番そのものではなく、同じ番号で始まる別の筆の位置です。"
@@ -2262,6 +2296,87 @@ def _show_quote() -> None:
             st.write("追加の筆はありません。")
 
 
+def _needs_manual_location(record: dict) -> bool:
+    location = record.get("location")
+    if record.get("error") or not location:
+        return False
+    return location["precision"] in ("town", "banchi", "nearby")
+
+
+def _show_manual_locations(records: list[dict]) -> None:
+    """位置が近似の筆に、地図で確かめた位置を入れて、判定し直せるようにする。"""
+    targets = [(index, record) for index, record in enumerate(records) if _needs_manual_location(record)]
+    if not targets:
+        return
+    report_id = st.session_state.get("report_id", 0)
+    st.markdown("---")
+    st.subheader("📌 位置を指定して判定し直す")
+    st.write(
+        "備付地図に位置が無い筆は、おおよその位置で表示しています。"
+        "MAPPLE法務局地図などで地番を確かめたら、その場所の緯度経度か、地図のURLを入れてください。"
+        "指定した位置で、判定をやり直します。"
+    )
+    st.caption(
+        "入れられるもの: 「31.7869, 130.3964」の緯度経度、Googleマップ・地理院地図・MAPPLE・Yahoo!地図のURL。"
+        "地図で筆の中心まで拡大してから、アドレスバーのURLをそのまま貼り付けられます。"
+        "短縮URL（maps.app.goo.gl など）は読めないため、緯度経度を入れてください。"
+    )
+    leftover = st.session_state.pop("manual_location_problems", None)
+    if leftover:
+        st.warning("位置を読み取れなかった筆: " + "、".join(leftover) + "。日本国内の緯度経度、または地図のURLを入れてください。")
+    inputs: dict[int, str] = {}
+    for index, record in targets:
+        location = record["location"]
+        label = f"{record['town']} {record['chiban']}".strip()
+        with st.container(border=True):
+            st.markdown(f"**{label}**　（今の位置: {_precision_note(location['precision'], location['display_name'])}）")
+            inputs[index] = st.text_input(
+                "指定する位置",
+                key=f"manual_loc_{report_id}_{index}",
+                placeholder="31.7869, 130.3964 または 地図のURL",
+                label_visibility="collapsed",
+            )
+            st.link_button(
+                "MAPPLE法務局地図で地番を確かめる",
+                _mapple_url(location["lat"], location["lon"]),
+            )
+    if not st.button("指定した位置で判定し直す", type="primary", key=f"manual_apply_{report_id}"):
+        return
+    changed = 0
+    problems = []
+    for index, text in inputs.items():
+        if not text.strip():
+            continue
+        record = records[index]
+        label = f"{record['town']} {record['chiban']}".strip()
+        point = _parse_location_text(text)
+        if point is None:
+            problems.append(label)
+            continue
+        lat, lon = point
+        try:
+            hazard = assess_sediment_hazard(lat, lon, None)
+        except HazardLookupError as exc:
+            problems.append(f"{label}（{exc}）")
+            continue
+        record["location"] = {
+            "lat": lat,
+            "lon": lon,
+            "display_name": f"{label}（緯度経度 {lat:.6f}, {lon:.6f}）",
+            "precision": "manual",
+            "polygon": None,
+            "area_m2": None,
+        }
+        record["hazard"] = hazard
+        changed += 1
+    if problems:
+        st.session_state.manual_location_problems = problems
+    if changed:
+        st.session_state.last_report = records
+    if changed or problems:
+        st.rerun()
+
+
 def _show_report(records: list[dict]) -> None:
     total = len(records)
     st.markdown("---")
@@ -2278,6 +2393,8 @@ def _show_report(records: list[dict]) -> None:
             precision = location["precision"]
             if precision in ("parcel", "parent"):
                 st.caption(_precision_note(precision, location["display_name"]))
+            elif precision == "manual":
+                st.info(f"指定された位置で判定しています：{location['display_name']}")
             elif precision == "banchi":
                 st.warning(
                     "この地番は、備付地図に位置の情報がありません。"
@@ -2320,7 +2437,9 @@ def _show_report(records: list[dict]) -> None:
                 st.caption("緑は区域外、黄は警戒区域、赤は特別警戒区域です。航空写真: 国土地理院")
             else:
                 st.caption("航空写真: 国土地理院")
-            if precision in ("town", "banchi"):
+            if precision == "manual":
+                st.caption("位置情報: 指定された位置")
+            elif precision in ("town", "banchi"):
                 st.caption("位置情報: 国土地理院 住所検索")
             else:
                 st.caption("位置情報: 登記所備付地図データ（法務省、G空間情報センター提供）")
@@ -2430,6 +2549,7 @@ def _show_report(records: list[dict]) -> None:
                     f"{len(approximate)}筆は、筆そのものの位置ではなく、近似の位置です（備考欄を見てください）：{names}"
                     + ("\n\n同じ番号の番地を使っているため、地図のピンが同じ場所に重なっています。" if overlap else "")
                 )
+    _show_manual_locations(records)
     _show_share(records)
 
 # --- 実行ボタンが押された時の処理 ---
@@ -2490,6 +2610,7 @@ if submitted:
                 )
         status.empty()
         st.session_state.last_report = records
+        st.session_state.report_id = st.session_state.get("report_id", 0) + 1
 
 if st.session_state.get("last_report"):
     _show_report(st.session_state.last_report)
