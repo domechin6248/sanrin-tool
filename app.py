@@ -3,7 +3,9 @@ import io
 import json
 import math
 import os
+import re
 import struct
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -570,7 +572,7 @@ def _render_location_map(features: list[dict]) -> None:
 
     has_polygon = any(feature.get("polygon") for feature in features)
     if len(features) == 1 and not has_polygon:
-        zoom = 15 if features[0].get("precision") == "town" else 18
+        zoom = {"town": 15, "banchi": 16}.get(features[0].get("precision"), 18)
         mid_lat = float(features[0]["lat"])
         mid_lon = float(features[0]["lon"])
     else:
@@ -730,6 +732,43 @@ def _lookup_town(address: str) -> dict:
     }
 
 
+def _lookup_banchi(address: str, chiban: str) -> dict | None:
+    """備付地図に位置が無い地番のとき、国土地理院の住所検索で「同じ番号の番地」の位置を探す。
+
+    地番そのものの位置ではなく、同じ番号の番地の代表点（近似）。町名の代表点よりずっと近い。
+    """
+    normalized = unicodedata.normalize("NFKC", _normalize_chiban(chiban))
+    head = re.match(r"\d+", normalized)
+    if not head:
+        return None
+    number = head.group(0)
+    prefix = unicodedata.normalize("NFKC", address.strip())
+    try:
+        payload = _fetch_json(f"{GSI_URL}?{urllib.parse.urlencode({'q': f'{address.strip()}{number}'})}")
+    except GeocodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    for feature in payload:
+        title = str(feature.get("properties", {}).get("title", ""))
+        flat = unicodedata.normalize("NFKC", title)
+        if not flat.startswith(prefix):
+            continue
+        rest = flat[len(prefix) :]
+        if not re.match(rf"{number}(?!\d)", rest):
+            continue
+        lon, lat = feature["geometry"]["coordinates"]
+        return {
+            "lat": float(lat),
+            "lon": float(lon),
+            "display_name": title,
+            "precision": "banchi",
+            "polygon": None,
+            "area_m2": None,
+        }
+    return None
+
+
 def _normalize_chiban(chiban: str) -> str:
     """全角数字と各種ハイフンを、検索用の半角表記にそろえる。"""
     return chiban.translate(str.maketrans("０１２３４５６７８９－−ーｰ‐―", "0123456789------")).strip()
@@ -799,6 +838,10 @@ def geocode_address(address: str, chiban: str) -> dict:
         parent["precision"] = "parent"
         parent["display_name"] = exact.get("display_name") or stem
         return parent
+
+    banchi = _lookup_banchi(address, normalized or original)
+    if banchi is not None:
+        return banchi
 
     if nearby is not None:
         return nearby
@@ -953,9 +996,35 @@ def _looks_like_chiban(token: str) -> bool:
     return "番" in token
 
 
+_DIGITS = "0123456789０１２３４５６７８９"
+_CHIBAN_TAIL = re.compile(r"[0-9０-９]+(?:[-－−ー‐―][0-9０-９]+)*")
+
+
 def _split_parcel_tokens(text: str) -> list[str]:
-    normalized = text.replace("、", " ").replace("，", " ").replace(",", " ")
+    """空白・読点・カンマ・セミコロンのほか、数字どうしを結ぶ「・」「/」でも区切る。"""
+    normalized = re.sub(r"(?<=[0-9０-９])[・/／](?=[0-9０-９])", " ", text)
+    for mark in ("、", "，", ",", ";", "；"):
+        normalized = normalized.replace(mark, " ")
     return [part for part in normalized.split() if part]
+
+
+def _match_known_town(token: str, towns_by_length: list[str]) -> tuple[str, str] | None:
+    """token が既知の町名で始まっていれば（町名, 残り）を返す。"""
+    for town in towns_by_length:
+        if not token.startswith(town):
+            continue
+        rest = token[len(town) :]
+        if rest == "" or rest[0] in _DIGITS:
+            return town, rest
+    return None
+
+
+def _split_address_chiban(token: str) -> tuple[str, str] | None:
+    """「…市比野３２００−１０１」のように町名と地番がつながった語を分ける。"""
+    match = re.fullmatch(r"(.+?[^0-9０-９\-－−ー‐―\s])(" + _CHIBAN_TAIL.pattern + ")", token)
+    if match and not _looks_like_chiban(match.group(1)):
+        return match.group(1), match.group(2)
+    return None
 
 
 def _parse_parcels(
@@ -964,73 +1033,86 @@ def _parse_parcels(
     base_address: str,
     default_town: str,
 ) -> list[dict]:
-    """行ごとに、町名と地番へ分ける。町名が無い行は選択中の町を使う。"""
+    """行ごとに、町名と地番へ分ける。町名が無い地番は、直前の町か選択中の町を使う。
+
+    同じ行に町名と地番が何度出てきてもよい（例：「平佐町 1 2 天辰町 3」）。
+    """
     towns_by_length = sorted(town_names, key=len, reverse=True)
-    parcels = []
+    parcels: list[dict] = []
     seen: set[tuple[str, str]] = set()
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        matched_town = ""
-        remainder = line
-        for town in towns_by_length:
-            if not line.startswith(town):
-                continue
-            tail = line[len(town) :]
-            if tail == "" or tail[0] in " 　,、，" or tail[0].isdigit() or "０" <= tail[0] <= "９":
-                matched_town = town
-                remainder = tail.strip(" 　,、，")
-                break
-        if matched_town:
-            address = f"{base_address}{matched_town}"
-            chiban_tokens = _split_parcel_tokens(remainder)
-            town_label = matched_town
-        else:
-            tokens = _split_parcel_tokens(line)
-            chiban_at = next((index for index, token in enumerate(tokens) if _looks_like_chiban(token)), None)
-            if chiban_at is None:
-                continue
-            if chiban_at == 0:
-                if not default_town or not base_address:
-                    parcels.append(
-                        {
-                            "address": "",
-                            "town": "",
-                            "chiban": " ".join(tokens),
-                            "error": "町名がありません。行の先頭に町名を書くか、リストから町を選んでください。",
-                        }
-                    )
-                    continue
-                address = f"{base_address}{default_town}"
-                town_label = default_town
-                chiban_tokens = tokens
-            else:
-                address = "".join(tokens[:chiban_at])
-                if base_address and not _starts_with_prefecture(address):
-                    town_label = address
-                    address = f"{base_address}{address}"
-                elif _starts_with_prefecture(address):
-                    town_label = _town_from_address(address)
-                else:
-                    town_label = address
-                chiban_tokens = tokens[chiban_at:]
-        if not chiban_tokens:
-            parcels.append(
-                {
-                    "address": address,
-                    "town": town_label,
-                    "chiban": "",
-                    "error": "地番がありません。",
-                }
-            )
-            continue
-        for chiban in chiban_tokens:
-            key = (address, chiban)
+
+    def add(address: str, town: str, chiban: str, error: str = "") -> None:
+        key = (address, chiban)
+        if not error:
             if key in seen:
-                continue
+                return
             seen.add(key)
-            parcels.append({"address": address, "town": town_label, "chiban": chiban, "error": ""})
+        parcels.append({"address": address, "town": town, "chiban": chiban, "error": error})
+
+    def free_town(pieces: list[str]) -> tuple[str, str]:
+        address = "".join(pieces)
+        if base_address and not _starts_with_prefecture(address):
+            return f"{base_address}{address}", address
+        if _starts_with_prefecture(address):
+            return address, _town_from_address(address)
+        return address, address
+
+    for raw_line in text.splitlines():
+        tokens = _split_parcel_tokens(raw_line.strip())
+        if not tokens:
+            continue
+        current: tuple[str, str] | None = None  # (住所, 町名)
+        count = 0  # current の町で数えた地番の数
+        free_pieces: list[str] = []
+
+        def close_current() -> None:
+            if current is not None and count == 0:
+                add(current[0], current[1], "", "地番がありません。")
+
+        for raw_token in tokens:
+            token = raw_token
+            if base_address and token.startswith(base_address) and len(token) > len(base_address):
+                token = token[len(base_address) :]
+            hit = _match_known_town(token, towns_by_length)
+            if hit:
+                close_current()
+                town, rest = hit
+                current = (f"{base_address}{town}", town)
+                count = 0
+                free_pieces = []
+                if rest:
+                    add(current[0], current[1], rest)
+                    count += 1
+                continue
+            if _looks_like_chiban(token):
+                if current is None:
+                    if free_pieces:
+                        current = free_town(free_pieces)
+                        free_pieces = []
+                    elif default_town and base_address:
+                        current = (f"{base_address}{default_town}", default_town)
+                    else:
+                        add("", "", token, "町名がありません。行の先頭に町名を書くか、リストから町を選んでください。")
+                        continue
+                    count = 0
+                add(current[0], current[1], token)
+                count += 1
+                continue
+            joined = _split_address_chiban(token)
+            if joined:
+                close_current()
+                current = free_town([*free_pieces, joined[0]])
+                free_pieces = []
+                count = 0
+                add(current[0], current[1], joined[1])
+                count += 1
+                continue
+            # 既知の町名でも地番でもない語は、自由入力の住所の一部として貯める。
+            if current is not None:
+                close_current()
+                current = None
+            free_pieces.append(token)
+        close_current()
     return parcels
 
 
@@ -1047,8 +1129,10 @@ def _precision_note(precision: str, display_name: str) -> str:
         return f"照合した地番：{display_name}"
     if precision == "parent":
         return f"枝番は備付地図に無かったため、親の筆を表示しています：{display_name}"
+    if precision == "banchi":
+        return f"備付地図に位置が無いため、同じ番号の番地の位置（近似）です。筆の実際の位置とずれることがあります：{display_name}"
     if precision == "nearby":
-        return f"近い筆：{display_name}"
+        return f"同じ番号で始まる別の筆です（指定の地番ではありません）：{display_name}"
     return f"筆は見つからず、町名の代表点です：{display_name}"
 
 
@@ -1120,8 +1204,10 @@ def _share_items(records: list[dict]) -> list[dict]:
             [float(point[1]), float(point[0])]
             for point in (location.get("polygon") or [])
         ]
-        if location.get("precision") == "nearby":
-            note = "指定の地番そのものではなく、近い筆の位置です。"
+        if location.get("precision") == "banchi":
+            note = "備付地図に位置が無いため、同じ番号の番地の位置（近似）です。"
+        elif location.get("precision") == "nearby":
+            note = "指定の地番そのものではなく、同じ番号で始まる別の筆の位置です。"
         elif location.get("precision") == "parent":
             note = "地番そのものは備付地図に無かったため、親の筆の位置です。"
         elif location.get("precision") == "town":
@@ -2189,17 +2275,27 @@ def _show_report(records: list[dict]) -> None:
             hazard = record["hazard"]
             st.success("✅ 調査が完了しました！")
             st.write(f"**対象：** {record['address']}　{record['chiban']}")
-            if location["precision"] == "parcel":
-                st.caption(_precision_note(location["precision"], location["display_name"]))
-            elif location["precision"] == "parent":
-                st.caption(_precision_note(location["precision"], location["display_name"]))
-            elif location["precision"] == "nearby":
-                st.caption(
-                    f"指定の地番そのものは見つからず、近い筆を表示しています：{location['display_name']}"
+            precision = location["precision"]
+            if precision in ("parcel", "parent"):
+                st.caption(_precision_note(precision, location["display_name"]))
+            elif precision == "banchi":
+                st.warning(
+                    "この地番は、備付地図に位置の情報がありません。"
+                    f"代わりに、同じ番号の番地の位置（近似）を表示しています：{location['display_name']}\n\n"
+                    "筆の実際の位置とは、ずれることがあります。判定は目安です。現地や地図で位置を確かめてください。"
+                )
+            elif precision == "nearby":
+                st.warning(
+                    "指定の地番そのものは見つかりませんでした。"
+                    f"同じ番号で始まる別の筆を表示しています：{location['display_name']}\n\n"
+                    "この筆の判定は、指定の地番の判定ではありません。"
                 )
             else:
-                st.caption(
-                    f"地番の筆は見つからなかったため、町名の代表点です：{location['display_name']}"
+                st.warning(
+                    "この地番の位置は特定できませんでした。表示しているのは、町名の代表点です："
+                    f"{location['display_name']}\n\n"
+                    "筆の位置ではないため、ハザードの判定は行っていません。"
+                    "地番を確かめるか、地図で位置を探してください。"
                 )
             area_m2 = location.get("area_m2")
             metric_columns = st.columns(3 if area_m2 else 2)
@@ -2210,17 +2306,21 @@ def _show_report(records: list[dict]) -> None:
             if area_m2:
                 with metric_columns[2]:
                     st.metric(label="地積", value=f"{area_m2:,.1f} ㎡")
-            _show_risk_detail(hazard["risk"])
-            st.caption(
-                "区域判定: ハザードマップポータル（国土数値情報 土砂災害警戒区域）。"
-                "2.5万分の1相当の参考図で、県の公示図の代わりにはなりません。"
-            )
+            if hazard:
+                _show_risk_detail(hazard["risk"])
+                st.caption(
+                    "区域判定: ハザードマップポータル（国土数値情報 土砂災害警戒区域）。"
+                    "2.5万分の1相当の参考図で、県の公示図の代わりにはなりません。"
+                )
             st.write("📍 **取得した位置マップ**")
             _render_location_map(
                 [_map_feature(f"{record['town']} {record['chiban']}".strip(), location, hazard)]
             )
-            st.caption("緑は区域外、黄は警戒区域、赤は特別警戒区域です。航空写真: 国土地理院")
-            if location["precision"] == "town":
+            if hazard:
+                st.caption("緑は区域外、黄は警戒区域、赤は特別警戒区域です。航空写真: 国土地理院")
+            else:
+                st.caption("航空写真: 国土地理院")
+            if precision in ("town", "banchi"):
                 st.caption("位置情報: 国土地理院 住所検索")
             else:
                 st.caption("位置情報: 登記所備付地図データ（法務省、G空間情報センター提供）")
@@ -2320,6 +2420,16 @@ def _show_report(records: list[dict]) -> None:
             _render_location_map(map_features)
             st.caption("緑は区域外、黄は警戒区域、赤は特別警戒区域です。航空写真: 国土地理院")
             st.caption("位置情報: 登記所備付地図データ（法務省、G空間情報センター提供）")
+            approximate = [
+                record for record in located if record["location"]["precision"] in ("banchi", "nearby")
+            ]
+            if approximate:
+                names = "、".join(_where(record) for record in approximate)
+                overlap = len({(r["location"]["lat"], r["location"]["lon"]) for r in approximate}) < len(approximate)
+                st.warning(
+                    f"{len(approximate)}筆は、筆そのものの位置ではなく、近似の位置です（備考欄を見てください）：{names}"
+                    + ("\n\n同じ番号の番地を使っているため、地図のピンが同じ場所に重なっています。" if overlap else "")
+                )
     _show_share(records)
 
 # --- 実行ボタンが押された時の処理 ---
@@ -2351,8 +2461,7 @@ if submitted:
                 continue
             try:
                 location = geocode_address(parcel["address"], parcel["chiban"])
-                judge_town_point = total == 1
-                if location["precision"] == "town" and not judge_town_point:
+                if location["precision"] == "town":
                     hazard = None
                 else:
                     hazard = assess_sediment_hazard(
