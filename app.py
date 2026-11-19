@@ -2083,9 +2083,21 @@ def _quote_plan(rows: list[dict]) -> dict:
 
 
 
-def _quote_doc_url(total: int, rows: list[dict]) -> str:
-    """見積の合計と対象地を、書類作成ツールへ渡すURLにする。"""
+def _quote_item_label(line: dict) -> str:
+    """見積書の明細に載せる項目名。"""
+    if str(line.get("計算", "")).startswith("基本引き取り料金"):
+        return f"{line['計算']}（{line['地番']}）"
+    zone = str(line.get("ハザード判定") or "")
+    kind = "追加料金" if zone == "通常" else zone
+    return f"{line['地番']}（{kind}・{line['計算']}）"
+
+
+def _quote_doc_url(total: int, rows: list[dict], plan: dict | None = None) -> str:
+    """見積の合計・内訳・対象地を、書類作成ツールへ渡すURLにする。"""
     params: list[tuple[str, str]] = [("fee", str(total))]
+    for line in ((plan or {}).get("frame_lines") or []) + ((plan or {}).get("extra_lines") or []):
+        if line.get("_amount", 0) > 0:
+            params.append(("item", f"{_quote_item_label(line)}|{line['_amount']}"))
     receipt = str(st.session_state.get("receipt_no") or "").strip()
     if receipt:
         params.append(("receipt", receipt))
@@ -2105,9 +2117,10 @@ def _quote_doc_url(total: int, rows: list[dict]) -> str:
                 str(record.get("address") or ""),
                 str(record.get("chiban") or ""),
                 area,
+                str(row.get("固定資産税額") or ""),
             ])))
         else:
-            params.append(("land", f"|{label}|"))
+            params.append(("land", f"|{label}||{row.get('固定資産税額') or ''}"))
     docs_url = _normalized_url(_setting("DOCS_APP_URL")) or _DEFAULT_DOCS_APP_URL
     return docs_url + "?" + urllib.parse.urlencode(params)
 
@@ -2274,8 +2287,8 @@ def _show_quote() -> None:
     plan = _quote_plan(rows)
     st.metric("合計引き取り費用", _yen_text(plan["total"]))
     if plan["total"] > 0:
-        st.link_button("この見積で書類を作る", _quote_doc_url(plan["total"], rows))
-        st.caption("書類作成ツールに、合計の引き取り費用、対象の土地、入力した受付番号が入ります。")
+        st.link_button("この見積で書類を作る", _quote_doc_url(plan["total"], rows, plan))
+        st.caption("書類作成ツールに、合計の引き取り費用、内訳、対象の土地、固定資産税額、入力した受付番号が入ります。見積書もここから作れます。")
     with st.container(border=True):
         st.markdown("**基本枠の内訳**")
         st.caption(
