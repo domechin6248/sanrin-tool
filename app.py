@@ -1898,7 +1898,7 @@ if default_town:
     st.caption("町を選んで地番を書き、「この地番を追加」を押してください。別の町も同じ手順で一覧に足せます。")
 submitted = st.button("🔍 査定・ハザード調査を実行する", type="primary")
 
-# 引き取り費用。レッドとイエローは税額より下限が優先され、倍率は基本枠の中で割増になる。
+# 引き取り費用。レッドとイエローは税額より下限が優先され、「リスク引き受け料」として独立した行で足す。
 _QUOTE_BASIC_PARCELS = 3
 _QUOTE_BASIC_TAX_LIMIT = 10_000
 _QUOTE_BASIC_FEE = 300_000
@@ -2048,48 +2048,62 @@ def _quote_plan(rows: list[dict]) -> dict:
             }
         )
     extra_lines = []
+    risk_lines = []
     for item in priced:
-        if item["ハザード判定"] == "通常" and item["index"] in frame_indexes:
-            continue
-        if item["ハザード判定"] == "通常":
-            amount, formula = _quote_extra_amount(item["固定資産税額"])
-        else:
+        if item["ハザード判定"] != "通常":
             amount = item["hazard_amount"]
-            formula = item["hazard_formula"] + ("（基本枠内の割増）" if item["index"] in frame_indexes else "")
-        line = {
-            "地番": item["地番"],
-            "ハザード判定": item["ハザード判定"],
-            "固定資産税額": _yen_text(item["固定資産税額"]),
-            "計算": formula,
-            "金額": _yen_text(amount),
-            "_amount": amount,
-        }
+            risk_lines.append(
+                {
+                    "地番": item["地番"],
+                    "ハザード判定": item["ハザード判定"],
+                    "固定資産税額": _yen_text(item["固定資産税額"]),
+                    "計算": item["hazard_formula"],
+                    "金額": _yen_text(amount),
+                    "_amount": amount,
+                }
+            )
+            continue
         if item["index"] in frame_indexes:
-            frame_lines.append(line)
-        else:
-            extra_lines.append(line)
+            continue
+        amount, formula = _quote_extra_amount(item["固定資産税額"])
+        extra_lines.append(
+            {
+                "地番": item["地番"],
+                "ハザード判定": item["ハザード判定"],
+                "固定資産税額": _yen_text(item["固定資産税額"]),
+                "計算": formula,
+                "金額": _yen_text(amount),
+                "_amount": amount,
+            }
+        )
     frame_subtotal = sum(line["_amount"] for line in frame_lines)
     extra_subtotal = sum(line["_amount"] for line in extra_lines)
+    risk_subtotal = sum(line["_amount"] for line in risk_lines)
     frame_tax = sum(priced[index]["固定資産税額"] for index in best_frame)
     return {
         "frame_lines": frame_lines,
         "extra_lines": extra_lines,
+        "risk_lines": risk_lines,
         "frame_count": len(best_frame),
         "frame_subtotal": frame_subtotal,
         "extra_subtotal": extra_subtotal,
+        "risk_subtotal": risk_subtotal,
         "frame_tax": frame_tax,
-        "total": frame_subtotal + extra_subtotal,
+        "total": frame_subtotal + extra_subtotal + risk_subtotal,
     }
 
 
 
 def _quote_item_label(line: dict) -> str:
-    """見積書の明細に載せる項目名。"""
+    """見積書の明細に載せる項目名（基本料金と追加料金）。"""
     if str(line.get("計算", "")).startswith("基本引き取り料金"):
         return f"{line['計算']}（{line['地番']}）"
-    zone = str(line.get("ハザード判定") or "")
-    kind = "追加料金" if zone == "通常" else zone
-    return f"{line['地番']}（{kind}・{line['計算']}）"
+    return f"{line['地番']}（追加料金・{line['計算']}）"
+
+
+def _quote_risk_detail(risk_lines: list[dict]) -> str:
+    """見積書の「リスク引き受け料」の行に添える、対象の筆と区分。"""
+    return "、".join(f"{line['地番']}（{line['ハザード判定']}・{line['計算']}）" for line in risk_lines)
 
 
 def _quote_doc_url(total: int, rows: list[dict], plan: dict | None = None) -> str:
@@ -2098,6 +2112,9 @@ def _quote_doc_url(total: int, rows: list[dict], plan: dict | None = None) -> st
     for line in ((plan or {}).get("frame_lines") or []) + ((plan or {}).get("extra_lines") or []):
         if line.get("_amount", 0) > 0:
             params.append(("item", f"{_quote_item_label(line)}|{line['_amount']}"))
+    risk_lines = [line for line in ((plan or {}).get("risk_lines") or []) if line.get("_amount", 0) > 0]
+    if risk_lines:
+        params.append(("risk", f"{_quote_risk_detail(risk_lines)}|{sum(line['_amount'] for line in risk_lines)}"))
     receipt = str(st.session_state.get("receipt_no") or "").strip()
     if receipt:
         params.append(("receipt", receipt))
@@ -2307,6 +2324,13 @@ def _show_quote() -> None:
             st.write(f"追加の小計　**{_yen_text(plan['extra_subtotal'])}**")
         else:
             st.write("追加の筆はありません。")
+    with st.container(border=True):
+        st.markdown("**リスク引き受け料（警戒区域）**")
+        if plan["risk_lines"]:
+            _show_quote_table(plan["risk_lines"])
+            st.write(f"リスク引き受け料　**{_yen_text(plan['risk_subtotal'])}**")
+        else:
+            st.write("警戒区域の筆はありません。")
 
 
 def _needs_manual_location(record: dict) -> bool:
